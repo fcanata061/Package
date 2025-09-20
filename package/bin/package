@@ -99,6 +99,7 @@ resolve_cmd() {
     ls|list)          echo "list" ;;
     srv|service)      echo "service" ;;
     h|help|--help)    echo "help" ;;
+    full|all)        echo "full" ;;
     *)                echo "$cmd" ;;
   esac
 }
@@ -190,6 +191,21 @@ main() {
       ;;
     help)
       usage
+      ;;
+    full)
+      # pipeline completo
+      local port="$1"
+      [ -z "$port" ] && { err "Uso: package full <categoria/port>"; exit 2; }
+
+      info "Executando processo completo para $port"
+
+      if declare -F cmd_fetch >/dev/null; then cmd_fetch "$port"; fi
+      if declare -F cmd_deps >/dev/null; then cmd_deps "$port"; fi
+      if declare -F cmd_patch >/dev/null; then cmd_patch "$port"; fi
+      if declare -F cmd_build >/dev/null; then cmd_build "$port"; fi
+      if declare -F cmd_install >/dev/null; then cmd_install "$port"; fi
+
+      info "Port $port instalado com sucesso via full"
       ;;
     *)
       err "Comando desconhecido: $cmd_orig"
