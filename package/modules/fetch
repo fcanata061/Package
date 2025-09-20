@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# modules/fetch.sh
+# Responsável por baixar o "source" do port
+
+cmd_fetch() {
+  local port_path="$1"
+  [ -n "$port_path" ] || { err "fetch requer port (ex: net/httpd)"; return 2; }
+  local portdir="$PORTSDIR/$port_path"
+  [ -d "$portdir" ] || { err "Port não encontrado: $portdir"; return 3; }
+  # exemplo: ports contêm arquivo Makefile com URL (básico)
+  local url
+  url=$(sed -n 's/^DISTFILE[[:space:]]*=\s*\(.*\)/\1/p' "$portdir/Makefile" || true)
+  if [ -z "$url" ]; then
+    # fallback: procurar DISTFILE ou FETCH_URL
+    url=$(grep -E "DISTFILE|FETCH_URL" "$portdir/Makefile" | head -n1 | awk -F= '{print $2}' | tr -d ' \"')
+  fi
+  mkdir -p "$CACHE_DIR"
+  if [ -n "$url" ]; then
+    log "Baixando $url para $CACHE_DIR"
+    cd "$CACHE_DIR" && wget -c "$url"
+  else
+    err "URL do source não encontrada no Makefile do port"
+    return 4
+  fi
+}
