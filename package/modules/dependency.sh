@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # modules/dependency.sh
-# Gerenciamento avançado de dependências com grafo e ordenação topológica
+# Dependência avançada com grafo, topológica, comparação de versões e upgrade automático
 #
-# Funções expostas:
-#  - cmd_deps <categoria/port> [tree|topo|graphviz|install|dry-run]
-#  - resolve_and_install_deps <categoria/port> [--dry-run]
+# Expondo:
+#  - cmd_deps <categoria/port> [tree|topo|graphviz|install|dry-run] [--no-upgrade]
+#  - resolve_and_install_deps <categoria/port> [--dry-run] [--no-upgrade]
 #
-# Dependências externas esperadas:
-#  - register_is_installed <categoria/port> -> retorna 0 se instalado
-#  - cmd_build <categoria/port> -> constrói/instala o port
+# Requisitos (funções externas esperadas; há fallbacks mínimos):
+#  - register_is_installed <port>
+#  - get_installed_version <port>  -> echos installed version or empty
+#  - cmd_build <port>
+#  - cmd_upgrade <port>            -> optional but used if present
+#  - log_info/log_warn/log_error
 #
-# Variáveis:
-#  PORTSDIR, DEP_LOG_DIR, PARALLEL_JOBS
+# Vars: PORTSDIR, DEP_LOG_DIR, PARALLEL_JOBS
 
 PORTSDIR=${PORTSDIR:-/usr/ports}
 DEP_LOG_DIR=${DEP_LOG_DIR:-/var/log/package/deps}
@@ -19,63 +21,92 @@ PARALLEL_JOBS=${PARALLEL_JOBS:-1}
 
 mkdir -p "$DEP_LOG_DIR"
 
-# fallbacks de logging
+# fallback loggers
 : "${log_info:=:}"
 : "${log_warn:=:}"
 : "${log_error:=:}"
-: "${register_is_installed:=:}"
-: "${cmd_build:=:}"
 
 if ! declare -F log_info >/dev/null; then log_info(){ echo "[deps][INFO] $*"; }; fi
 if ! declare -F log_warn >/dev/null; then log_warn(){ echo "[deps][WARN] $*"; }; fi
 if ! declare -F log_error >/dev/null; then log_error(){ echo "[deps][ERROR] $*" >&2; }; fi
+
+# fallback stubs for external functions if absent
 if ! declare -F register_is_installed >/dev/null; then
-  register_is_installed(){ return 1; } # assume not installed if not provided
+  register_is_installed(){ return 1; } # assume not installed
+fi
+if ! declare -F get_installed_version >/dev/null; then
+  # fallback: try reading INSTALLED_DB file format "categoria_port" in /var/lib/package/installed/<category_port>
+  get_installed_version() {
+    local port="$1"
+    local INSTALLED_DB=${INSTALLED_DB:-/var/lib/package/installed}
+    local cat="${port%%/*}"; local name="${port##*/}"
+    local file="$INSTALLED_DB/${cat}_${name}"
+    if [ -f "$file" ]; then
+      grep '^VERSION=' "$file" | cut -d= -f2
+    else
+      echo ""
+    fi
+  }
 fi
 if ! declare -F cmd_build >/dev/null; then
-  cmd_build(){ log_error "cmd_build não disponível: integrar com build.sh"; return 2; }
+  cmd_build(){ log_error "cmd_build não disponível — integre build.sh"; return 2; }
+fi
+if ! declare -F cmd_upgrade >/dev/null; then
+  # leave absent; module will error if needs to upgrade but no cmd_upgrade available
+  cmd_upgrade(){ log_error "cmd_upgrade não disponível"; return 2; }
 fi
 
-# -------------------- utilitários --------------------
+# ---------------- helpers versão ----------------
+# normalize version string (strip spaces)
+_vnorm(){ printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'; }
 
-# Extrai valor de variável do Makefile (suporta continuação com \)
+# version_ge v1 v2 -> 0 if v1 >= v2
+version_ge() {
+  local v1=$(_vnorm "$1"); local v2=$(_vnorm "$2")
+  if [ -z "$v2" ]; then return 0; fi
+  if [ -z "$v1" ]; then return 1; fi
+  # use sort -V; smallest first -> if head == v2, then v2 <= v1 => v1 >= v2
+  [ "$(printf '%s\n%s\n' "$v1" "$v2" | sort -V | head -n1)" = "$v2" ]
+}
+
+version_eq(){ [ "$(_vnorm "$1")" = "$(_vnorm "$2")" ]; }
+
+# version_satisfies installed op ver -> 0 if true
+version_satisfies() {
+  local inst="$(_vnorm "$1")" op="$2" req="$(_vnorm "$3")"
+  [ -z "$op" ] && return 0
+  case "$op" in
+    ">=") version_ge "$inst" "$req" ;;
+    "<=") version_ge "$req" "$inst" ;; # inst <= req -> req >= inst
+    "=")  version_eq "$inst" "$req" ;;
+    ">")  version_ge "$inst" "$req" && ! version_eq "$inst" "$req" ;;
+    "<")  version_ge "$req" "$inst" && ! version_eq "$inst" "$req" ;;
+    *)    return 1 ;;
+  esac
+}
+
+# ---------------- parse Makefile deps ----------------
 _makefile_var() {
   local port="$1" var="$2"
   local mf="$PORTSDIR/$port/Makefile"
   [ -f "$mf" ] || return 1
-  # pega linhas que começam com VAR= e junta continuations
+  # capture VAR=... with continuation backslashes
   awk -v v="$var" '
-    BEGIN{out=""; inblock=0}
     $0 ~ "^[[:space:]]*"v"[[:space:]]*=" {
       sub("^[[:space:]]*"v"[[:space:]]*=","");
-      line=$0;
-      # accumulate continuation lines ending with \
-      while (line ~ /\\$/) {
-        sub(/\\$/,"",line);
-        out=out line;
-        if (getline next) { line = next } else { break }
+      val=$0;
+      while (val ~ /\\$/) {
+        sub(/\\$/,"",val);
+        if (getline nx) val = val nx; else break;
       }
-      out=out line;
-      gsub(/[[:space:]]+$/, "", out);
-      gsub(/^[[:space:]]+/, "", out);
-      print out;
-    }' "$mf" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | sed 's/#.*//'
+      gsub(/^[[:space:]]+/,"",val); gsub(/[[:space:]]+$/,"",val);
+      print val;
+    }' "$mf" | sed 's/#.*//'
 }
 
-# Tokeniza uma string de dependências em tokens por whitespace
-_tokenize_deps() {
-  local s="$*"
-  # remove múltiplos espaços e quebra em tokens
-  # preserve slash and operators in token
-  for tok in $s; do
-    echo "$tok"
-  done
-}
+_tokenize_deps(){ local s="$*"; for t in $s; do echo "$t"; done; }
 
-# Parse token: retorna "name op ver"
-# exemplos:
-#   devel/libfoo>=1.2  -> devel/libfoo >= 1.2
-#   editors/vim         -> editors/vim  ""  ""
+# parse token e retorna três campos: name op ver
 _parse_dep_token() {
   local tok="$1"
   if [[ "$tok" =~ ^([^><=]+)(>=|<=|=|>|<)(.+)$ ]]; then
@@ -85,142 +116,86 @@ _parse_dep_token() {
   fi
 }
 
-# -------------------- grafo (associative arrays) --------------------
-# usamos Bash associative arrays; requer bash >=4
-declare -A _adj    # adjacency: node -> "n1 n2 n3"
-declare -A _indeg  # indegree: node -> number
-declare -A _nodes  # set: node -> 1
-declare -A _ver    # node -> requested version (if any), e.g. ">=1.2"
+# ---------------- grafo structures ----------------
+declare -A _adj _indeg _nodes _reqver
+_graph_reset(){ _adj=(); _indeg=(); _nodes=(); _reqver=(); }
 
-_graph_reset() {
-  _adj=()
-  _indeg=()
-  _nodes=()
-  _ver=()
-}
-
-_graph_add_node() {
-  local n="$1"
-  _nodes["$n"]=1
+_graph_add_node(){
+  local n="$1"; _nodes["$n"]=1
   [ -n "${_adj[$n]:-}" ] || _adj["$n"]=""
   [ -n "${_indeg[$n]:-}" ] || _indeg["$n"]=0
 }
 
-_graph_add_edge() {
+_graph_add_edge(){
   local from="$1" to="$2"
-  # add nodes
-  _graph_add_node "$from"
-  _graph_add_node "$to"
-  # append to adjacency if not already present
+  _graph_add_node "$from"; _graph_add_node "$to"
+  # avoid duplicate edge
   if [[ " ${_adj[$from]} " != *" $to "* ]]; then
     _adj["$from"]="${_adj[$from]} $to"
     _indeg["$to"]=$(( ${_indeg["$to"]} + 1 ))
   fi
 }
 
-# -------------------- construir grafo recursivamente --------------------
-# build_graph <root>
-# - percorre dependências (BUILD_DEPENDS e RUN_DEPENDS) e popula _adj/_nodes/_ver
-_build_graph_recursive() {
-  local port="$1"
-  local seen="$2"  # pipe-delimited seen list to avoid revisiting
-
-  # detect revisit
-  if [[ "$seen" == *"|$port|"* ]]; then
-    return 0
-  fi
+# ---------------- build graph recusive (collect req versions) ----------------
+_build_graph_recursive(){
+  local port="$1"; local seen="$2"
+  if [[ "$seen" == *"|$port|"* ]]; then return 0; fi
   seen="$seen|$port|"
-
-  # add node for port
   _graph_add_node "$port"
 
-  # read build deps
-  local bstr rstr tok name op ver
+  local bstr rstr tok nm op ver
   bstr=$(_makefile_var "$port" "BUILD_DEPENDS" 2>/dev/null || true)
   rstr=$(_makefile_var "$port" "RUN_DEPENDS" 2>/dev/null || true)
 
   for tok in $(_tokenize_deps $bstr); do
-    IFS=$'\t' read -r name op ver < <(_parse_dep_token "$tok")
-    # store version requirement if present (only first wins)
-    if [ -n "$op" ] && [ -n "$ver" ] && [ -z "${_ver[$name]:-}" ]; then
-      _ver["$name"]="${op}${ver}"
-    fi
-    _graph_add_edge "$port" "$name"
-    _build_graph_recursive "$name" "$seen"
+    IFS=$'\t' read -r nm op ver < <(_parse_dep_token "$tok")
+    [ -n "$op" ] && [ -n "$ver" ] && [ -z "${_reqver[$nm]:-}" ] && _reqver["$nm"]="${op}${ver}"
+    _graph_add_edge "$port" "$nm"
+    _build_graph_recursive "$nm" "$seen"
   done
 
   for tok in $(_tokenize_deps $rstr); do
-    IFS=$'\t' read -r name op ver < <(_parse_dep_token "$tok")
-    if [ -n "$op" ] && [ -n "$ver" ] && [ -z "${_ver[$name]:-}" ]; then
-      _ver["$name"]="${op}${ver}"
-    fi
-    _graph_add_edge "$port" "$name"
-    _build_graph_recursive "$name" "$seen"
+    IFS=$'\t' read -r nm op ver < <(_parse_dep_token "$tok")
+    [ -n "$op" ] && [ -n "$ver" ] && [ -z "${_reqver[$nm]:-}" ] && _reqver["$nm"]="${op}${ver}"
+    _graph_add_edge "$port" "$nm"
+    _build_graph_recursive "$nm" "$seen"
   done
 }
 
-# Public API: build_graph <root>
-build_graph() {
-  local root="$1"
-  _graph_reset
-  _build_graph_recursive "$root" "|"
-}
+build_graph(){ local root="$1"; _graph_reset; _build_graph_recursive "$root" "|"; }
 
-# -------------------- detectar ciclo via DFS (branco/cinza/preto) --------------------
-# retorna 0 se sem ciclos, 1 se ciclo detectado (e imprime a cadeia)
-_detect_cycle_dfs() {
-  local node="$1"
-  declare -A seen_local
-  # We'll implement DFS iteratively with stacks to produce path on cycle detection
-  # but simpler - recursive helper:
-  _cycle_found=0
-  _cycle_path=""
+# ---------------- cycle detection DFS ----------------
+_detect_cycle_dfs(){
+  local _cycle_found=0 _cycle_path=""
+  declare -Ag _visited
+  for n in "${!_nodes[@]}"; do unset _visited["$n"]; done
 
-  _dfs_visit() {
-    local n="$1"
-    local stack="$2"
-    # mark gray by adding to stack
-    stack="$stack|$n"
-    # iterate adjacency
-    local neigh
-    for neigh in ${_adj[$n]}; do
-      # if neigh is already in stack -> cycle
-      if [[ "$stack" == *"|$neigh|"* ]]; then
+  _dfs_visit(){
+    local node="$1" stack="$2"
+    stack="$stack|$node|"
+    _visited["$node"]=1
+    for nb in ${_adj[$node]}; do
+      if [[ "$stack" == *"|$nb|"* ]]; then
         _cycle_found=1
-        _cycle_path="$stack|$neigh|"
-        return 0
+        _cycle_path="$stack$nb|"; return 0
       fi
-      # if not visited (we track visited in global _visited)
-      if [ -z "${_visited[$neigh]:-}" ]; then
-        _visited["$neigh"]=1
-        _dfs_visit "$neigh" "$stack" || return 0
-        [ $_cycle_found -eq 1 ] && return 0
+      if [ -z "${_visited[$nb]:-}" ]; then
+        _dfs_visit "$nb" "$stack" || return 0
+        [ "$_cycle_found" -eq 1 ] && return 0
       fi
     done
   }
 
-  # initialize visited array
-  declare -Ag _visited
-  for n in "${!_nodes[@]}"; do
-    unset _visited["$n"]
-  done
-
   for n in "${!_nodes[@]}"; do
     if [ -z "${_visited[$n]:-}" ]; then
-      _visited["$n"]=1
-      _dfs_visit "$n" "|$n|" || true
-      if [ $_cycle_found -eq 1 ]; then
-        # print cycle nicely
-        local p="${_cycle_path#|}"
-        p="${p%|}"
-        # convert to -> sequence
-        local out=""
+      _dfs_visit "$n" "|"
+      if [ "$_cycle_found" -eq 1 ]; then
+        local p="${_cycle_path#|}"; p="${p%|}"
         IFS='|' read -r -a arr <<< "$p"
-        for i in "${arr[@]}"; do
-          [ -z "$i" ] && continue
-          if [ -z "$out" ]; then out="$i"; else out="$out -> $i"; fi
-        done
-        log_error "Ciclo de dependência detectado: $out"
+        local out=""
+        for x in "${arr[@]}"; do [ -z "$x" ] && continue; out="${out}${x} -> "; done
+        out="${out% -> }"
+        log_error "Ciclo detectado: $out"
         return 1
       fi
     fi
@@ -228,173 +203,147 @@ _detect_cycle_dfs() {
   return 0
 }
 
-# -------------------- ordenação topológica (Kahn) --------------------
-# topo_sort -> prints one node per line in install order (dependencies first)
-topo_sort() {
-  local -A indeg_copy
-  local -a zeroq
-  local n q head i out
-  # copy indegree
+# ---------------- topo sort (Kahn) ----------------
+topo_sort(){
+  local -A indeg_copy; local -a zeroq order
   for n in "${!_nodes[@]}"; do indeg_copy["$n"]=${_indeg["$n"]:-0}; done
-
-  # push nodes with indeg 0
-  for n in "${!_nodes[@]}"; do
-    if [ "${indeg_copy[$n]}" -eq 0 ]; then
-      zeroq+=("$n")
-    fi
-  done
-
+  for n in "${!_nodes[@]}"; do [ "${indeg_copy[$n]}" -eq 0 ] && zeroq+=("$n"); done
   while [ "${#zeroq[@]}" -gt 0 ]; do
-    # pop head
-    head="${zeroq[0]}"
-    zeroq=("${zeroq[@]:1}")
-    printf '%s\n' "$head"
-    # for each neighbor, decrement indeg
-    for i in ${_adj[$head]}; do
-      indeg_copy["$i"]=$(( indeg_copy["$i"] - 1 ))
-      if [ "${indeg_copy[$i]}" -eq 0 ]; then
-        zeroq+=("$i")
-      fi
+    local h="${zeroq[0]}"; zeroq=("${zeroq[@]:1}")
+    order+=("$h")
+    for nb in ${_adj[$h]}; do
+      indeg_copy["$nb"]=$(( indeg_copy["$nb"] - 1 ))
+      if [ "${indeg_copy[$nb]}" -eq 0 ]; then zeroq+=("$nb"); fi
     done
   done
-
-  # check if any node still has indeg > 0 => cycle
+  # if any node still has indeg >0 -> cycle
   for n in "${!_nodes[@]}"; do
-    if [ "${indeg_copy[$n]}" -gt 0 ]; then
-      log_error "Impossível ordenar topo: ciclo detectado (nodo com indegree > 0)"
-      return 1
-    fi
+    if [ "${indeg_copy[$n]:-0}" -gt 0 ]; then log_error "topo_sort: ciclo detectado"; return 1; fi
   done
-
-  return 0
+  # print order
+  for n in "${order[@]}"; do printf '%s\n' "$n"; done
 }
 
-# -------------------- util: imprimir árvore (dfs) --------------------
-_print_tree_recursive() {
-  local node="$1" indent="$2" seen="$3"
-  if [[ "$seen" == *"|$node|"* ]]; then
-    printf "%s%s (already shown)\n" "$indent" "$node"
-    return
-  fi
-  seen="$seen|$node|"
-  printf "%s%s\n" "$indent" "$node"
-  for c in ${_adj[$node]}; do
-    _print_tree_recursive "$c" "  $indent" "$seen"
-  done
-}
+# ---------------- print tree and graphviz ----------------
+_print_tree_recursive(){ local node="$1" indent="$2" seen="$3"; if [[ "$seen" == *"|$node|"* ]]; then printf "%s%s (seen)\n" "$indent" "$node"; return; fi; seen="$seen|$node|"; printf "%s%s\n" "$indent" "$node"; for c in ${_adj[$node]}; do _print_tree_recursive "$c" "  $indent" "$seen"; done; }
+print_tree(){ _print_tree_recursive "$1" "" "|"; }
 
-print_tree() {
-  local root="$1"
-  _print_tree_recursive "$root" "" "|"
-}
-
-# -------------------- util: output graphviz DOT --------------------
-graphviz_dot() {
-  echo "digraph deps {"
-  echo "  node [shape=box];"
+graphviz_dot(){
+  echo "digraph deps { node [shape=box];"
   for n in "${!_nodes[@]}"; do
-    local label="$n"
-    if [ -n "${_ver[$n]:-}" ]; then label="$label\\n(${_ver[$n]})"; fi
-    printf '  "%s" [label="%s"];\n' "$n" "$label"
+    local lbl="$n"; [ -n "${_reqver[$n]:-}" ] && lbl="$lbl\\n(${_reqver[$n]})"
+    printf '  "%s" [label="%s"];\n' "$n" "$lbl"
   done
-  for n in "${!_nodes[@]}"; do
-    for c in ${_adj[$n]}; do
-      printf '  "%s" -> "%s";\n' "$n" "$c"
-    done
-  done
+  for n in "${!_nodes[@]}"; do for c in ${_adj[$n]}; do printf '  "%s" -> "%s";\n' "$n" "$c"; done; done
   echo "}"
 }
 
-# -------------------- resolver e instalar na ordem topológica --------------------
-# resolve_and_install_deps <root> [--dry-run]
-resolve_and_install_deps() {
-  local root="$1"
-  local dry="${2:-}"
+# ---------------- check version and possibly upgrade ----------------
+# ensure_node_satisfied <node> <no_upgrade_flag>
+ensure_node_satisfied(){
+  local node="$1"; local no_upgrade="$2"
+  local req="${_reqver[$node]:-}" inst
+  if register_is_installed "$node"; then
+    inst="$(get_installed_version "$node" 2>/dev/null || echo "")"
+    if [ -n "$req" ]; then
+      # parse req into op+ver
+      if [[ "$req" =~ ^(>=|<=|=|>|<)(.+)$ ]]; then
+        local op="${BASH_REMATCH[1]}" ver="${BASH_REMATCH[2]}"
+        if version_satisfies "$inst" "$op" "$ver"; then
+          log_info "Versão instalada de $node ($inst) satisfaz $op$ver"
+          return 0
+        else
+          log_warn "Versão instalada de $node ($inst) NÃO satisfaz $op$ver"
+          if [ "$no_upgrade" = "1" ]; then
+            log_error "Não atualizar: política --no-upgrade ativa. Aborting."
+            return 2
+          fi
+          # try upgrade
+          if declare -F cmd_upgrade >/dev/null; then
+            log_info "Tentando atualizar $node via cmd_upgrade..."
+            cmd_upgrade "$node" || { log_error "cmd_upgrade falhou para $node"; return 1; }
+            # re-read installed version
+            inst="$(get_installed_version "$node" 2>/dev/null || echo "")"
+            if version_satisfies "$inst" "$op" "$ver"; then
+              log_info "Upgrade bem-sucedido: $node -> $inst"
+              return 0
+            else
+              log_error "Após upgrade, $node ($inst) ainda não satisfaz $op$ver"
+              return 1
+            fi
+          else
+            log_error "cmd_upgrade não disponível; não é possível atualizar $node"
+            return 1
+          fi
+        fi
+      else
+        # malformed req
+        log_warn "Requisito de versão malformado para $node: $req"
+        return 0
+      fi
+    else
+      # no req version -> ok
+      log_info "$node já instalado (versão $inst)"
+      return 0
+    fi
+  else
+    # not installed -> need to build/install
+    log_info "$node não está instalado"
+    return 100  # special code meaning 'install required'
+  fi
+}
+
+# ---------------- resolve and install in topological order ----------------
+resolve_and_install_deps(){
+  local root="$1"; local dry="${2:-}"; local no_upgrade="${3:-}"
   build_graph "$root"
+  _detect_cycle_dfs || return 1
 
-  # detect cycles
-  _detect_cycle_dfs >/dev/null 2>&1 || return 1
+  # produce topo order and reverse it so that dependencies come first
+  local -a order; while IFS= read -r n; do order+=("$n"); done < <(topo_sort) || return 1
+  local -a install_order; for ((i=${#order[@]}-1;i>=0;i--)); do install_order+=("${order[i]}"); done
 
-  # get topo order into array (dependencies last printed? We print nodes such that
-  # dependencies come after edges from parent to dep; but we built edges port->dep,
-  # so topo_sort will produce nodes with no deps first (leafs). For installation
-  # we want to install dependencies before dependents; so we will reverse the topo result.)
-  local -a order
-  while IFS= read -r n; do order+=("$n"); done < <(topo_sort) || return 1
-
-  # reverse order so dependencies installed first
-  local -a install_order
-  for (( idx=${#order[@]}-1; idx>=0; idx-- )); do
-    install_order+=("${order[idx]}")
-  done
-
-  # filter out the root itself from installing if desired? Usually we install deps then root.
-  # We'll install all nodes in install_order but skip nodes already installed.
   log_info "Ordem de instalação (dependencies first):"
   local idx node
-  for idx in "${!install_order[@]}"; do
-    node="${install_order[$idx]}"
-    printf "%3d. %s" "$((idx+1))" "$node"
-    if register_is_installed "$node"; then
-      printf " (already installed)\n"
-      continue
-    else
-      printf "\n"
-    fi
-  done
+  for idx in "${!install_order[@]}"; do node="${install_order[$idx]}"; printf "%3d. %s\n" "$((idx+1))" "$node"; done
 
   if [ "$dry" = "--dry-run" ]; then
-    log_info "Dry-run: não será instalada nenhuma dependência."
+    log_info "Dry-run: nenhuma ação será tomada."
     return 0
   fi
 
-  # Install sequentially (could be parallelized with care)
   for node in "${install_order[@]}"; do
-    if register_is_installed "$node"; then
-      log_info "Pular $node — já instalado"
+    ensure_node_satisfied "$node" "$no_upgrade"
+    local rc=$?
+    if [ $rc -eq 0 ]; then
+      log_info "OK: $node"
       continue
-    fi
-    log_info "Instalando $node ..."
-    if ! cmd_build "$node"; then
-      log_error "Falha ao instalar dependência $node"
+    elif [ $rc -eq 100 ]; then
+      # needs install
+      log_info "Instalando node $node ..."
+      cmd_build "$node" || { log_error "Falha ao construir $node"; return 1; }
+    else
+      log_error "Erro verificando $node (code $rc)"
       return 1
     fi
-    log_info "Instalado: $node"
   done
-
   return 0
 }
 
-# -------------------- CLI --------------------
-cmd_deps() {
-  local port="$1"
-  local action="${2:-topo}" # default topo
-  [ -n "$port" ] || { log_error "Uso: package deps <categoria/port> [tree|topo|graphviz|install|dry-run]"; return 2; }
-
+# ---------------- CLI ----------------
+cmd_deps(){
+  local port="$1"; local action="${2:-topo}"; local flag3="$3"
+  [ -n "$port" ] || { log_error "Uso: package deps <categoria/port> [tree|topo|graphviz|install|dry-run] [--no-upgrade]"; return 2; }
   build_graph "$port"
-
   case "$action" in
-    tree)
-      print_tree "$port"
-      ;;
-    topo)
-      topo_sort
-      ;;
-    graphviz)
-      graphviz_dot
-      ;;
-    install)
-      resolve_and_install_deps "$port"
-      ;;
-    dry-run)
-      resolve_and_install_deps "$port" "--dry-run"
-      ;;
-    *)
-      log_error "Ação desconhecida: $action"
-      return 2
-      ;;
+    tree) print_tree "$port" ;;
+    topo) topo_sort ;;
+    graphviz) graphviz_dot ;;
+    install) resolve_and_install_deps "$port" "" "${flag3:-}" ;;
+    dry-run) resolve_and_install_deps "$port" "--dry-run" "${flag3:-}" ;;
+    *) log_error "Ação desconhecida: $action"; return 2 ;;
   esac
 }
 
-# expose functions if sourced
+# export
 export -f cmd_deps build_graph topo_sort graphviz_dot resolve_and_install_deps
