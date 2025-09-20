@@ -1,25 +1,18 @@
 #!/usr/bin/env bash
 # modules/build.sh
-# --- Gerenciamento de build de ports ---
-#
-# Fluxo:
-#   1. Resolver dependências (dependency.sh)
-#   2. Preparar sandbox (sandbox.sh)
-#   3. Executar hooks (hooks.sh)
-#   4. Configurar -> Compilar -> Testar
-#   5. Instalar em STAGEDIR
-#   6. Instalar no sistema real via fakeroot (fakeroot.sh)
-#   7. Registrar log e banco de pacotes (logs.sh, register.sh)
+# --- Sistema completo de build de ports ---
 
 PORTSDIR=${PORTSDIR:-/usr/ports}
 STAGING_ROOT=${STAGING_ROOT:-/var/tmp/package/stage}
 INSTALLED_DB=${INSTALLED_DB:-/var/lib/package/installed}
+BUILD_LOG_DIR=${BUILD_LOG_DIR:-/var/log/package/builds}
 
-mkdir -p "$STAGING_ROOT"
+mkdir -p "$STAGING_ROOT" "$BUILD_LOG_DIR"
 
-# injeção de dependências (funções externas)
+# injeção de dependências externas
 : "${resolve_all:=:}"
 : "${fakeroot_install:=:}"
+: "${patch_apply:=:}"
 : "${hooks_run:=:}"
 : "${log_info:=:}"
 : "${log_warn:=:}"
@@ -41,7 +34,7 @@ get_make_var() {
 }
 
 # -----------------------------------------------------------------------------
-# Executar build no sandbox
+# Função principal de build dentro do sandbox
 # -----------------------------------------------------------------------------
 build_in_sandbox() {
   local port_path="$1"
@@ -56,13 +49,10 @@ build_in_sandbox() {
   version=$(get_make_var "$port_path" VERSION)
   src_url=$(get_make_var "$port_path" MASTER_SITES)
 
-  # 1. Pré-configure hook
-  hooks_run "$port_path" pre-configure "$workdir" || return 1
-
-  # 2. Extrair código-fonte
-  log_info "Extraindo código de $port_path"
-  tarball="$PORTSDIR/$port_path/distfiles/${name}-${version}.tar.gz"
+  local tarball="$PORTSDIR/$port_path/distfiles/${name}-${version}.tar.gz"
   [ -f "$tarball" ] || { log_error "Tarball não encontrado: $tarball"; return 1; }
+
+  log_info "Extraindo código-fonte para $workdir"
   tar -xf "$tarball" -C "$workdir" || return 1
 
   srcdir="$workdir/${name}-${version}"
@@ -70,7 +60,12 @@ build_in_sandbox() {
 
   cd "$srcdir" || return 1
 
-  # 3. Configure
+  # --- fase de patch ---
+  hooks_run "$port_path" pre-patch "$srcdir"
+  patch_apply "$port_path" "$srcdir" || return 1
+  hooks_run "$port_path" post-patch "$srcdir"
+
+  # --- fase de configure ---
   hooks_run "$port_path" pre-configure "$srcdir"
   if [ -x "./configure" ]; then
     log_info "Rodando ./configure"
@@ -78,20 +73,22 @@ build_in_sandbox() {
   fi
   hooks_run "$port_path" post-configure "$srcdir"
 
-  # 4. Build
+  # --- fase de build ---
+  hooks_run "$port_path" pre-build "$srcdir"
   log_info "Compilando $port_path"
   make || return 1
+  hooks_run "$port_path" post-build "$srcdir"
 
-  # 5. Test (opcional)
+  # --- fase de test ---
   if make -n check >/dev/null 2>&1; then
     log_info "Rodando testes"
     make check || log_warn "Alguns testes falharam em $port_path"
   fi
 
-  # 6. Instalar em STAGEDIR
+  # --- fase de install ---
+  hooks_run "$port_path" pre-install "$srcdir"
   log_info "Instalando em STAGEDIR $stagedir"
   mkdir -p "$stagedir"
-  hooks_run "$port_path" pre-install "$srcdir"
   make DESTDIR="$stagedir" install || return 1
   hooks_run "$port_path" post-install "$srcdir"
 
@@ -99,47 +96,57 @@ build_in_sandbox() {
 }
 
 # -----------------------------------------------------------------------------
-# Função principal: cmd_build
+# Função principal cmd_build
 # -----------------------------------------------------------------------------
 cmd_build() {
   local port_path="$1"
   [ -n "$port_path" ] || { log_error "Uso: package build <categoria/port>"; return 2; }
 
-  log_info "Iniciando build de $port_path"
+  local logfile="$BUILD_LOG_DIR/$(echo "$port_path" | tr '/' '_').log"
+  rm -f "$logfile"
 
-  # 1. Resolver dependências
-  log_info "Resolvendo dependências..."
-  resolve_all "$port_path" "|" "|" || return 1
+  log_info "=== Iniciando build de $port_path ==="
+  exec 3>&1 1>>"$logfile" 2>&1  # redireciona saída para log
 
-  # 2. Criar sandbox
+  # --- dependências ---
+  log_info "[fase] Resolvendo dependências"
+  resolve_all "$port_path" "|" "|" || { log_error "Falha nas dependências"; return 1; }
+
+  # --- criar sandbox ---
+  log_info "[fase] Criando sandbox"
   sandbox_dir="$(mktemp -d /var/tmp/package-sandbox.XXXXXX)"
   stagedir="$STAGING_ROOT/$(echo "$port_path" | tr '/' '_')"
-  mkdir -p "$stagedir"
+  rm -rf "$stagedir" && mkdir -p "$stagedir"
 
-  # 3. Rodar build dentro do sandbox
+  # --- build no sandbox ---
   if ! build_in_sandbox "$port_path" "$sandbox_dir" "$stagedir"; then
-    log_error "Build falhou para $port_path"
+    log_error "Build falhou para $port_path (veja $logfile)"
     rm -rf "$sandbox_dir"
+    exec 1>&3 3>&-  # restaura saída
     return 1
   fi
 
-  # 4. Instalar com fakeroot
+  # --- instalar no sistema real ---
+  log_info "[fase] Instalando no sistema real via fakeroot"
   if ! fakeroot_install "$stagedir" "$port_path"; then
     log_error "Instalação falhou para $port_path"
     rm -rf "$sandbox_dir"
+    exec 1>&3 3>&-
     return 1
   fi
 
-  # 5. Registrar no banco de instalados
+  # --- registrar ---
+  log_info "[fase] Registrando port"
   local version
   version=$(get_make_var "$port_path" VERSION)
-  register_install "$port_path" "$version" || return 1
+  register_install "$port_path" "$version" || { log_error "Registro falhou"; return 1; }
 
-  # 6. Rodar hooks pós-remove
+  # --- hooks pós instalação no sistema ---
   hooks_run "$port_path" post-install-system "/"
 
-  # 7. Limpeza
+  # --- limpeza ---
   rm -rf "$sandbox_dir"
+  log_info "=== Build concluído com sucesso para $port_path ==="
 
-  log_info "Build concluído para $port_path"
+  exec 1>&3 3>&-  # restaura saída
 }
