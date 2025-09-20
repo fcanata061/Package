@@ -1,24 +1,21 @@
 #!/usr/bin/env bash
-# modules/register.sh
-#
-# Registro de pacotes no banco local (/var/lib/package/db).
-# Cada pacote tem um manifest.json + registro global (INSTALLED_INDEX.json).
-#
-# Comandos:
-#   register_package <name> <version> <staging_dir>
-#   unregister_package <name> <version>
-#   list_packages
-#   info_package <name>
+# package/modules/register.sh (revisado)
+# Módulo “register” para o gerenciador “package”
+# - Registro de pacotes instalados
+# - Expor: cmd_register_list, cmd_register_info, register_port
 
 set -euo pipefail
 
-[ -f /etc/package.conf ] && source /etc/package.conf
+[ -f /etc/package.conf ] && source /etc/package.conf || true
 
-DBDIR=${DBDIR:-/var/lib/package/db}
-INDEX="$DBDIR/INSTALLED_INDEX.json"
-mkdir -p "$DBDIR"
+PORTSDIR=${PORTSDIR:-/usr/ports}
+FILES_DIR=${FILES_DIR:-/var/lib/package/files}
+REGISTRY_DIR=${REGISTRY_DIR:-/var/lib/package/registry}
+LOG_DIR=${LOG_DIR:-/var/log/package}
 
-# --- Logging ---
+mkdir -p "$FILES_DIR" "$REGISTRY_DIR" "$LOG_DIR"
+
+# Logging
 : "${log_info:=:}"
 : "${log_warn:=:}"
 : "${log_error:=:}"
@@ -30,117 +27,81 @@ if ! declare -F log_warn >/dev/null; then
   log_warn(){ echo "[register][WARN] $*"; }
 fi
 if ! declare -F log_error >/dev/null; then
-  log_error(){ echo "[register][ERROR] $*" >&2; }
+  log_error(){ echo "[register][ERROR] $*"; }
 fi
 
-# --- Dependências internas ---
-MODULESDIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
-source "$MODULESDIR/logs.sh"
-
-# --- Funções auxiliares ---
-_init_index() {
-  [ -f "$INDEX" ] || echo "[]" > "$INDEX"
+# Helper: port key derivado do caminho do port
+_port_key_from_rel() {
+  local rel="$1"
+  # remove prefix PORTSDIR/ se presente
+  rel="${rel#$PORTSDIR/}"
+  # substitui / por _
+  printf '%s' "${rel//\//_}"
 }
 
-_manifest_file() {
-  local name="$1" version="$2"
-  echo "$DBDIR/$name-$version.manifest.json"
+# Registrar um port: salvar metadados e lista de arquivos
+register_port() {
+  local portkey="$1"
+  local portver="$2"
+  local files_list="$3"
+
+  [ -f "$files_list" ] || { log_error "register_port: lista de arquivos não encontrada: $files_list"; return 1; }
+
+  # registro de metadata
+  local meta_file="${REGISTRY_DIR}/${portkey}.json"
+  local now
+  now=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  # montar JSON simples
+  cat > "$meta_file" <<EOF
+{
+  "portkey": "${portkey}",
+  "version": "${portver}",
+  "installed_at": "${now}",
+  "files_list": "${files_list}"
+}
+EOF
+
+  log_info "Pacote registrado: ${portkey} v${portver} -> ${meta_file}"
 }
 
-# --- Registrar pacote ---
-register_package() {
-  local name="$1" version="$2" staging="$3"
-
-  _init_index
-
-  local manifest="$(_manifest_file "$name" "$version")"
-  log_info "Registrando $name-$version em $manifest"
-
-  {
-    echo "{"
-    echo "  \"name\": \"$name\","
-    echo "  \"version\": \"$version\","
-    echo "  \"date\": \"$(date -u +%Y-%m-%dT%H:%M:%SZ)\","
-    echo "  \"files\": ["
-    find "$staging" -type f | sed "s#^$staging#$PREFIX#" | sed 's/$/,/' | sed '$ s/,$//'
-    echo "  ]"
-    echo "}"
-  } > "$manifest"
-
-  # Atualizar índice global
-  tmp=$(mktemp)
-  jq --arg n "$name" --arg v "$version" \
-     '. += [{"name":$n,"version":$v}]' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
-
-  log_event "register" "$name" "$version" "success"
+# Listar pacotes registrados
+cmd_register_list() {
+  # lista nomes de chaves no REGISTRY_DIR
+  for f in "$REGISTRY_DIR"/*.json; do
+    [ -f "$f" ] || continue
+    basename "$f" .json
+  done
 }
 
-# --- Remover registro ---
-unregister_package() {
-  local name="$1" version="$2"
-
-  _init_index
-
-  local manifest="$(_manifest_file "$name" "$version")"
-  rm -f "$manifest"
-
-  tmp=$(mktemp)
-  jq --arg n "$name" --arg v "$version" \
-     'map(select(.name != $n or .version != $v))' "$INDEX" > "$tmp" && mv "$tmp" "$INDEX"
-
-  log_info "Registro de $name-$version removido do banco"
-  log_event "unregister" "$name" "$version" "success"
+# Mostrar informações de um pacote registrado
+cmd_register_info() {
+  local portkey="$1"
+  [ -n "$portkey" ] || { log_error "Uso: package register info <portkey>"; return 2; }
+  local meta_file="${REGISTRY_DIR}/${portkey}.json"
+  if [ ! -f "$meta_file" ]; then
+    log_error "Não há registro para '${portkey}'"
+    return 1
+  fi
+  cat "$meta_file"
 }
 
-# --- Listar pacotes ---
-list_packages() {
-  _init_index
-  jq -r '.[] | "\(.name)-\(.version)"' "$INDEX"
-}
+export -f register_port cmd_register_list cmd_register_info
 
-# --- Mostrar info ---
-info_package() {
-  local name="$1"
-  _init_index
-
-  jq --arg n "$name" '.[] | select(.name==$n)' "$INDEX"
-}
-
-# --- Export ---
-export -f register_package unregister_package list_packages info_package
-
-# Execução direta
+# Integração CLI
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  case "${1:-}" in
-    register)
-      shift
-      if [ $# -lt 3 ]; then
-        echo "Uso: $0 register <name> <version> <staging_dir>"
-        exit 1
-      fi
-      register_package "$@"
-      ;;
-    unregister)
-      shift
-      if [ $# -lt 2 ]; then
-        echo "Uso: $0 unregister <name> <version>"
-        exit 1
-      fi
-      unregister_package "$@"
-      ;;
+  # Se chamado como script direto
+  case "$1" in
     list)
-      list_packages
+      shift
+      cmd_register_list
       ;;
     info)
       shift
-      if [ $# -lt 1 ]; then
-        echo "Uso: $0 info <name>"
-        exit 1
-      fi
-      info_package "$1"
+      cmd_register_info "$1"
       ;;
     *)
-      echo "Uso: $0 {register|unregister|list|info}"
+      echo "Uso: $0 list | info <portkey>" >&2
       exit 1
       ;;
   esac
