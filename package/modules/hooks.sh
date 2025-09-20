@@ -4,6 +4,7 @@
 
 set -euo pipefail
 
+# Configuração global
 [ -f /etc/package.conf ] && source /etc/package.conf || true
 PORTSDIR=${PORTSDIR:-/usr/ports}
 
@@ -12,7 +13,7 @@ log_info(){ echo "[hooks][INFO] $*"; }
 log_warn(){ echo "[hooks][WARN] $*"; }
 log_error(){ echo "[hooks][ERROR] $*" >&2; }
 
-# Extrai valor de variável do Makefile
+# Extrai valor de variável de um Makefile
 get_make_var() {
   local makefile="$1" var="$2"
   awk -v v="$var" '
@@ -27,7 +28,7 @@ get_make_var() {
   }' "$makefile" | sed 's/#.*//' | xargs
 }
 
-# Executa hook definido no Makefile
+# Executa hook se definido no Makefile
 run_hook() {
   local category_name="$1"  # ex: base/gcc
   local hookname="$2"       # ex: pre_build, post_install
@@ -46,4 +47,4 @@ run_hook() {
   fi
 }
 
-export -f run_hook
+export -f run_hook get_make_var
