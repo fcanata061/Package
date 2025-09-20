@@ -1,151 +1,126 @@
 #!/usr/bin/env bash
-# modules/install.sh
-#
-# Instala um port previamente construído (via build.sh) no sistema.
-# Inclui rollback em caso de falha, manifest JSON e integração com logs.
-#
-# Fluxo:
-#   1. Localiza staging (WORKDIR/<port>/staging)
-#   2. Executa hooks pre-install-system
-#   3. Copia arquivos com fakeroot (rsync)
-#   4. Gera manifest JSON
-#   5. Executa hooks post-install-system
-#   6. Registra no banco
-#   7. Ativa serviços, se houver
+# package/modules/install.sh (revisado)
+# Módulo "install" do gerenciador "package"
+# - Pega staging gerado pelo build
+# - Copia arquivos pro sistema usando fakeroot/sandbox quando disponível
+# - Atualiza registry/local database com lista de arquivos
+# - Exporta: cmd_install, install_port
 
 set -euo pipefail
 
-[ -f /etc/package.conf ] && source /etc/package.conf
+[ -f /etc/package.conf ] && source /etc/package.conf || true
 
 PORTSDIR=${PORTSDIR:-/usr/ports}
-WORKDIR=${WORKDIR:-/usr/ports/work}
-DBDIR=${DBDIR:-/var/lib/package/db}
-LOGDIR=${LOGDIR:-/var/log/package}
+WORKDIR=${WORKDIR:-/var/cache/package/work}
+FILES_DIR=${FILES_DIR:-/var/lib/package/files}
+REGISTRY_DIR=${REGISTRY_DIR:-/var/lib/package/registry}
+LOG_DIR=${LOG_DIR:-/var/log/package}
 PREFIX=${PREFIX:-/usr/local}
-TRASHDIR=${TRASHDIR:-/var/lib/package/trash}
 
-mkdir -p "$WORKDIR" "$DBDIR" "$LOGDIR" "$TRASHDIR"
+mkdir -p "$WORKDIR" "$FILES_DIR" "$REGISTRY_DIR" "$LOG_DIR"
 
-# --- Logging ---
-: "${log_info:=:}"
-: "${log_warn:=:}"
-: "${log_error:=:}"
+# Logging fallbacks
+: "${log_info:=:}"; : "${log_warn:=:}"; : "${log_error:=:}"; : "${log_event:=:}"
+if ! declare -F log_info >/dev/null; then log_info(){ echo "[install][INFO] $*"; }; fi
+if ! declare -F log_warn >/dev/null; then log_warn(){ echo "[install][WARN] $*"; }; fi
+if ! declare -F log_error >/dev/null; then log_error(){ echo "[install][ERROR] $*" >&2; }; fi
+if ! declare -F log_event >/dev/null; then log_event(){ :; }; fi
 
-if ! declare -F log_info >/dev/null; then
-  log_info(){ echo "[install][INFO] $*"; }
+# Source fakeroot/sandbox/registry se existirem
+MODULE_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+[ -f "$MODULE_DIR/fakeroot.sh" ] && source "$MODULE_DIR/fakeroot.sh"
+[ -f "$MODULE_DIR/sandbox.sh" ] && source "$MODULE_DIR/sandbox.sh"
+[ -f "$MODULE_DIR/register.sh" ] && source "$MODULE_DIR/register.sh"
+
+# Fallbacks
+if ! declare -F fakeroot_install_from_staging >/dev/null; then
+  fakeroot_install_from_staging(){
+    local staging="$1" port="$2"
+    log_warn "fakeroot não disponível; copiando direto (pode precisar sudo)"
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null; then
+      sudo rsync -a "$staging"/ /
+    else
+      rsync -a "$staging"/ /
+    fi
+  }
 fi
-if ! declare -F log_warn >/dev/null; then
-  log_warn(){ echo "[install][WARN] $*"; }
+if ! declare -F sandbox_exec >/dev/null; then
+  sandbox_exec(){ bash -c "$*"; }
 fi
-if ! declare -F log_error >/dev/null; then
-  log_error(){ echo "[install][ERROR] $*" >&2; }
+if ! declare -F register_port >/dev/null; then
+  register_port(){ log_warn "register_port não implementado: $1"; }
 fi
 
-# --- Dependências internas ---
-MODULESDIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
-source "$MODULESDIR/hooks.sh"
-source "$MODULESDIR/fakeroot.sh"
-source "$MODULESDIR/register.sh"
-source "$MODULESDIR/service.sh"
-source "$MODULESDIR/logs.sh"
+# Helper: port key
+_port_key_from_dir(){ local dir="$1" rel="${dir#$PORTSDIR/}"; echo "${rel//\//_}"; }
 
-# --- Funções auxiliares ---
-
-_manifest_file() {
-  local name="$1" version="$2"
-  echo "$DBDIR/$name-$version.manifest.json"
-}
-
-_generate_manifest() {
-  local staging="$1" name="$2" version="$3"
-  local manifest="$(_manifest_file "$name" "$version")"
-
-  log_info "Gerando manifest $manifest"
-  {
-    echo "{"
-    echo "  \"name\": \"$name\","
-    echo "  \"version\": \"$version\","
-    echo "  \"files\": ["
-    find "$staging" -type f | sed 's#^'"$staging"'#/usr/local#' | sed 's/$/,/' | sed '$ s/,$//'
-    echo "  ]"
-    echo "}"
-  } > "$manifest"
-}
-
-# --- Função principal ---
-
-install_port() {
+install_port(){
   local port_dir="$1"
+  [ -d "$port_dir" ] || { log_error "install_port: diretório não encontrado: $port_dir"; return 1; }
+  [ -f "$port_dir/Makefile" ] || { log_error "install_port: Makefile não encontrado"; return 1; }
 
-  [ -f "$port_dir/Makefile" ] || {
-    log_error "Makefile não encontrado em $port_dir"
-    return 1
-  }
+  local mf="$port_dir/Makefile"
+  local portname portver portkey workdir staging files_list
 
-  local name version staging manifest
-  name=$(make -C "$port_dir" -s -f Makefile -V PORTNAME || basename "$port_dir")
-  version=$(make -C "$port_dir" -s -f Makefile -V PORTVERSION || echo "0")
-  staging="$WORKDIR/$name-$version/staging"
-  manifest="$(_manifest_file "$name" "$version")"
+  portname=$(awk '/^PORTNAME[ \t]*[:+]?=/ {print $3; exit}' "$mf" || true)
+  portver=$(awk '/^PORTVERSION[ \t]*[:+]?=/ {print $3; exit}' "$mf" || true)
+  [ -z "$portname" ] && portname=$(basename "$port_dir")
+  [ -z "$portver" ] && portver="0.0.0"
 
-  [ -d "$staging" ] || {
-    log_error "Staging não encontrado para $name-$version. Execute build.sh antes."
-    return 1
-  }
+  portkey=$(_port_key_from_dir "$port_dir")
+  workdir="$WORKDIR/$portkey-$portver"
+  staging="$workdir/staging"
+  files_list="$FILES_DIR/${portkey}.list"
 
-  log_info "=== Instalando $name-$version no sistema ==="
-  log_event "install" "$name" "$version" "start"
-
-  # Hooks pre-install-system
-  run_hook pre-install-system "$port_dir"
-
-  # Rollback: mover arquivos já existentes para TRASHDIR
-  local rollback_dir="$TRASHDIR/${name}-${version}-$(date +%s)"
-  mkdir -p "$rollback_dir"
-  log_info "Preparando rollback em $rollback_dir"
-
-  rsync -a --ignore-existing "$staging/" "$PREFIX/" || true
-  rsync -a --existing "$PREFIX/" "$rollback_dir/" || true
-
-  # Copiar staging para sistema (com fakeroot)
-  log_info "Copiando arquivos para $PREFIX"
-  if ! fakeroot_exec rsync -a "$staging/" "$PREFIX/"; then
-    log_error "Falha na cópia, iniciando rollback"
-    rsync -a "$rollback_dir/" "$PREFIX/"
-    log_event "install" "$name" "$version" "failed"
+  if [ ! -d "$staging" ]; then
+    log_error "Staging não encontrado para $portkey ($staging) — rode 'package build' antes"
     return 1
   fi
 
-  # Manifest JSON
-  _generate_manifest "$staging" "$name" "$version"
+  log_info "=== Iniciando instalação: $portkey v$portver ==="
+  log_event "install" "$portkey" "$portver" "start"
 
-  # Hooks post-install-system
-  run_hook post-install-system "$port_dir"
-
-  # Registrar no banco
-  log_info "Registrando $name-$version"
-  register_package "$name" "$version" "$staging"
-
-  # Ativar serviços (systemd)
-  if [ -d "$port_dir/service" ]; then
-    log_info "Ativando serviços para $name"
-    for svc in "$port_dir"/service/*; do
-      [ -f "$svc" ] || continue
-      service_install "$svc"
-    done
+  # Executa instalação real (fakeroot dentro do sandbox se definido)
+  if [ "${SANDBOX_METHOD:-none}" != "none" ]; then
+    log_info "Executando instalação dentro do sandbox ($SANDBOX_METHOD)"
+    sandbox_exec "fakeroot_install_from_staging '$staging' '$portkey'"
+  else
+    fakeroot_install_from_staging "$staging" "$portkey"
   fi
 
-  log_info "Instalação de $name-$version concluída."
-  log_event "install" "$name" "$version" "success"
+  # Atualiza registry
+  if [ -f "$files_list" ]; then
+    register_port "$portkey" "$portver" "$files_list"
+  else
+    log_warn "Lista de arquivos não encontrada: $files_list"
+  fi
+
+  log_info "Instalação concluída para $portkey v$portver"
+  log_event "install" "$portkey" "$portver" "success"
+  return 0
 }
 
-export -f install_port
+cmd_install(){
+  local port="$1"
+  [ -n "$port" ] || { log_error "Uso: package install <category/name>"; return 2; }
+  local port_dir="$PORTSDIR/$port"
+  if [ ! -d "$port_dir" ]; then
+    log_error "Port não encontrado: $port_dir"
+    return 1
+  fi
+  install_port "$port_dir"
+}
 
-# Execução direta
+export -f cmd_install install_port
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   if [ $# -lt 1 ]; then
-    echo "Uso: $0 <port_dir>"
+    echo "Uso: $0 <category/name> | <portdir>" >&2
     exit 1
   fi
-  install_port "$1"
+  if [ -d "$1" ] && [ -f "$1/Makefile" ]; then
+    install_port "$1"
+  else
+    cmd_install "$1"
+  fi
 fi
