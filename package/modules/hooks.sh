@@ -1,48 +1,53 @@
 #!/usr/bin/env bash
 # modules/hooks.sh
-# Gerencia hooks para cada fase do ciclo de vida do port
+# --- Hooks integrados ao Makefile de cada port ---
 #
-# Hooks suportados:
-# - pre_configure
-# - post_configure
-# - pre_install
-# - post_install
-# - pre_remove
-# - post_remove
+# Em vez de scripts separados, os hooks são alvos do próprio Makefile:
+#   pre-configure
+#   post-configure
+#   pre-build
+#   post-build
+#   pre-install
+#   post-install
+#   pre-remove
+#   post-remove
 #
-# Cada hook deve ser um script executável chamado <hook>.sh
-# localizado dentro do diretório do port (ex: /usr/ports/net/httpd/hooks/)
+# Chamados pelo build.sh em cada fase.
 
-run_hook() {
+PORTSDIR=${PORTSDIR:-/usr/ports}
+HOOK_LOG_DIR=${HOOK_LOG_DIR:-/var/log/package/hooks}
+mkdir -p "$HOOK_LOG_DIR"
+
+: "${log_info:=:}"
+: "${log_warn:=:}"
+: "${log_error:=:}"
+
+if ! declare -F log_info >/dev/null; then log_info(){ echo "[hooks][INFO] $*"; }; fi
+if ! declare -F log_warn >/dev/null; then log_warn(){ echo "[hooks][WARN] $*"; }; fi
+if ! declare -F log_error >/dev/null; then log_error(){ echo "[hooks][ERROR] $*" >&2; }; fi
+
+# -----------------------------------------------------------------------------
+# Executar hook definido no Makefile
+# -----------------------------------------------------------------------------
+hooks_run() {
   local port_path="$1"
-  local hook="$2"
-  local hook_dir="$PORTSDIR/$port_path/hooks"
-  local hook_script="$hook_dir/${hook}.sh"
+  local phase="$2"
+  local workdir="$3"
 
-  if [ -x "$hook_script" ]; then
-    log "Executando hook $hook para $port_path"
-    "$hook_script" "$port_path" || {
-      err "Hook $hook falhou para $port_path"
+  local makefile="$PORTSDIR/$port_path/Makefile"
+  local logfile="$HOOK_LOG_DIR/$(echo "$port_path" | tr '/' '_')_${phase}.log"
+
+  [ -f "$makefile" ] || { log_warn "Nenhum Makefile em $port_path"; return 0; }
+
+  # Checar se alvo existe no Makefile
+  if grep -q "^${phase}:" "$makefile"; then
+    log_info "Executando hook '$phase' via Makefile em $port_path"
+    ( cd "$workdir" && make -f "$makefile" "$phase" DESTDIR="$workdir/stage" ) >>"$logfile" 2>&1
+    if [ $? -ne 0 ]; then
+      log_error "Hook $phase falhou em $port_path — veja $logfile"
       return 1
-    }
+    fi
+  else
+    log_info "Hook $phase não definido em $port_path"
   fi
-}
-
-# Helpers que podem ser chamados nos módulos build/install/remove
-run_pre_configure()  { run_hook "$1" "pre_configure"; }
-run_post_configure() { run_hook "$1" "post_configure"; }
-
-run_pre_install()    { run_hook "$1" "pre_install"; }
-run_post_install()   { run_hook "$1" "post_install"; }
-
-run_pre_remove()     { run_hook "$1" "pre_remove"; }
-run_post_remove()    { run_hook "$1" "post_remove"; }
-
-# Comando CLI para executar hook manualmente
-cmd_hook() {
-  local port_path="$1"
-  local hook="$2"
-  [ -n "$port_path" ] || { err "hook requer port (ex: net/httpd)"; return 2; }
-  [ -n "$hook" ] || { err "hook requer o nome do hook"; return 2; }
-  run_hook "$port_path" "$hook"
 }
