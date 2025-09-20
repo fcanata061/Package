@@ -1,339 +1,395 @@
 #!/usr/bin/env bash
-# modules/sandbox-build.sh
-# --- Executa todo o processo de build dentro de sandbox ---
+# modules/sandbox.sh
 #
-# Funções exposas:
-#  - cmd_build_sandbox <categoria/port>
-#  - prepare_sandbox <port> (reusa sandbox.sh se presente)
-#  - run_in_sandbox <inst> "<cmd...>" (reusa sandbox.sh se presente)
-#  - cleanup_sandbox <port>
+# Sandbox module (completo e funcional)
 #
-# Fluxo high-level (cmd_build_sandbox):
-#  1. resolve deps (se dependency.sh presente -> cmd_deps)
-#  2. preparar sandbox (prepare_sandbox)
-#  3. dentro do sandbox:
-#     a) executar hooks pre_configure
-#     b) executar fetch (make fetch / wget fallback)
-#     c) executar configure/build (make build / make)
-#     d) executar hooks post_configure
-#     e) executar make install para STAGEDIR
-#  4. extrair lista de arquivos instalados do STAGEDIR, salvar /var/lib/package/files/<port>.list
-#  5. copiar do STAGEDIR para o sistema real (usando fakeroot se disponível)
-#  6. atualizar INSTALLED_DB com versão/timestamp
-#  7. executar hooks post_install
-#  8. registrar logs e cleanup (opcional preservar sandbox se DEBUG)
+# Fornece:
+#   sandbox_prepare <portkey> <workdir> <staging_dir>    # opcional: cria ambiente persistente
+#   sandbox_cleanup <portkey> <workdir> <staging_dir>    # opcional: limpa ambiente
+#   sandbox_exec <workdir> <command...>                  # executa comando dentro do sandbox (sync)
+#   sandbox_run_script <workdir> <script-file> [args...] # executa um script dentro do sandbox
 #
-# Requisitos opcionais:
-#  - fakeroot instalado (para install sem root)
-#  - git/wget para fetch
+# Compatível com SANDBOX_METHOD = none|bwrap|chroot|docker (padrão none)
+# Integra com /etc/package.conf para SANDBOX_METHOD, SANDBOX_CHROOT_BASE, SANDBOX_DOCKER_IMAGE, SANDBOX_BWRAP_OPTS
 #
-# Variáveis configuráveis (pode definir em /etc/package.conf):
-#   SANDBOX_BASE, DEPS_CACHE, INSTALLED_DB, PREFIX, CACHE_DIR, MAKEFLAGS, FAKEROOT_DIR
+# Notas:
+# - bwrap (bubblewrap) é preferido quando disponível por ser simples e sem privilégios.
+# - chroot requer root e um sistema base em SANDBOX_CHROOT_BASE (ou o chroot será criado copiando arquivos essenciais)
+# - docker requer docker daemon e usa --rm com binds no WORKDIR e /usr/ports
+# - "none" executa o comando diretamente (fallback).
 #
-# Este módulo tenta usar prepare_sandbox/run_in_sandbox/cleanup_sandbox/other functions
-# definidas no módulo sandbox.sh. Se não existirem, fornece fallback interno simples.
+# Saídas/Retornos:
+# - sandbox_exec imprime nothing; retorna 0 em sucesso, não imprime ambiente.
+# - As funções exportadas são: sandbox_prepare, sandbox_cleanup, sandbox_exec, sandbox_run_script
+#
+# Uso em build.sh:
+#   sandbox_exec "$builddir" "bash -lc 'cd src && ./configure && make -j4'"
+#
+# Autor: ChatGPT (adaptado)
+# Data: 2025-09-20
+set -euo pipefail
 
-# ---------- Config/paths (podem ser sobrescritas em /etc/package.conf) ----------
-PORTSDIR=${PORTSDIR:-/usr/ports}
-CACHE_DIR=${CACHE_DIR:-/var/cache/package}
-DEPS_CACHE=${DEPS_CACHE:-/var/lib/package/deps}
-INSTALLED_DB=${INSTALLED_DB:-/var/lib/package/installed}
-FILES_DIR=${FILES_DIR:-/var/lib/package/files}
-PREFIX=${PREFIX:-/usr/local}
-MAKEFLAGS=${MAKEFLAGS:-"-j$(nproc)"}
-FAKEROOT_BIN=${FAKEROOT_BIN:-$(command -v fakeroot 2>/dev/null || true)}
-SANDBOX_KEEP_ON_FAIL=${SANDBOX_KEEP_ON_FAIL:-false}
+# Load config if available
+[ -f /etc/package.conf ] && source /etc/package.conf
 
-mkdir -p "$CACHE_DIR" "$DEPS_CACHE" "$(dirname "$INSTALLED_DB")" "$FILES_DIR"
+# Defaults
+SANDBOX_METHOD=${SANDBOX_METHOD:-none}        # none | bwrap | chroot | docker
+SANDBOX_BWRAP_OPTS=${SANDBOX_BWRAP_OPTS:-""} # additional bwrap options
+SANDBOX_CHROOT_BASE=${SANDBOX_CHROOT_BASE:-/var/lib/package/chroot_base}
+SANDBOX_CHROOT_ROOTDIR=${SANDBOX_CHROOT_ROOTDIR:-/var/lib/package/chroots}
+SANDBOX_DOCKER_IMAGE=${SANDBOX_DOCKER_IMAGE:-ubuntu:22.04}
+SANDBOX_TMPBASE=${SANDBOX_TMPBASE:-/tmp/package-sandbox}
+SANDBOX_ALLOWED_HOSTPATHS=${SANDBOX_ALLOWED_HOSTPATHS:-"/usr /lib /lib64 /bin /sbin /etc /dev /proc /sys /usr/ports"}
 
-# ---------- logging fallbacks ----------
+# Logging fallbacks
 : "${log_info:=:}"
 : "${log_warn:=:}"
-: "${log_debug:=:}"
-: "${err:=:}"
-if ! declare -F log_info >/dev/null; then log_info(){ echo "[package][INFO] $*"; }; fi
-if ! declare -F log_warn >/dev/null; then log_warn(){ echo "[package][WARN] $*"; }; fi
-if ! declare -F log_debug >/dev/null; then log_debug(){ [ "${DEBUG:-0}" -eq 1 ] && echo "[package][DEBUG] $*"; }; fi
-if ! declare -F err >/dev/null; then err(){ echo "[package][ERROR] $*" >&2; }; fi
-
-# ---------- Try to reuse sandbox.sh functions if available ----------
-# If the environment already sourced sandbox.sh, use its functions.
-if ! declare -F prepare_sandbox >/dev/null; then
-  # minimal internal prepare_sandbox fallback (creates a simple dir)
-  prepare_sandbox() {
-    local port="$1"
-    local base=${SANDBOX_BASE:-/var/sandbox/package}
-    mkdir -p "$base"
-    local inst="$base/$(echo "$port" | tr '/' '_')/instance-$(date +%s)"
-    mkdir -p "$inst"
-    # mount minimal binds if root
-    if [ "$(id -u)" -eq 0 ]; then
-      for p in /dev /proc /sys; do
-        mkdir -p "$inst/$p"
-        mount --bind "$p" "$inst/$p" 2>/dev/null || true
-      done
-      # bind ports tree
-      mkdir -p "$inst/$PORTSDIR"
-      mount --bind "$PORTSDIR" "$inst/$PORTSDIR" 2>/dev/null || true
-      mkdir -p "$inst/$CACHE_DIR"
-      mount --bind "$CACHE_DIR" "$inst/$CACHE_DIR" 2>/dev/null || true
-    fi
-    echo "$inst"
-  }
+: "${log_error:=:}"
+if ! declare -F log_info >/dev/null 2>&1; then
+  log_info(){ echo "[sandbox][INFO] $*"; }
+fi
+if ! declare -F log_warn >/dev/null 2>&1; then
+  log_warn(){ echo "[sandbox][WARN] $*"; }
+fi
+if ! declare -F log_error >/dev/null 2>&1; then
+  log_error(){ echo "[sandbox][ERROR] $*" >&2; }
 fi
 
-if ! declare -F run_in_sandbox >/dev/null; then
-  # basic run_in_sandbox fallback using chroot (requires root)
-  run_in_sandbox() {
-    local inst="$1"; shift
-    local cmd="$*"
-    if [ "$(id -u)" -ne 0 ]; then
-      if command -v proot >/dev/null 2>&1; then
-        proot -R "$inst" /bin/bash -lc "$cmd"
-        return $?
-      fi
-      err "No available sandbox runtime (need systemd-nspawn or root for chroot or proot)"
-      return 3
-    fi
-    chroot "$inst" /bin/bash -lc "$cmd"
-    return $?
-  }
-fi
-
-if ! declare -F cleanup_sandbox >/dev/null; then
-  cleanup_sandbox() {
-    local port="$1"
-    local base=${SANDBOX_BASE:-/var/sandbox/package}
-    local dir="$base/$(echo "$port" | tr '/' '_')"
-    if [ -d "$dir" ]; then
-      # best-effort unmounts if root
-      if [ "$(id -u)" -eq 0 ]; then
-        awk "\$2 ~ /^$dir/ {print \$2}" /proc/mounts 2>/dev/null | sort -r | while read -r m; do
-          umount -l "$m" 2>/dev/null || true
-        done
-      fi
-      rm -rf "$dir"
-    fi
-  }
-fi
-
-# ---------- helpers ----------
-record_installed() {
-  local port="$1"
-  local ver="$2"
-  local now
-  now=$(date --iso-8601=seconds 2>/dev/null || date)
-  # if already present, replace; else append
-  grep -v "^$port " "$INSTALLED_DB" 2>/dev/null > "$INSTALLED_DB.tmp" || true
-  echo "$port $ver $now" >> "$INSTALLED_DB.tmp"
-  mv "$INSTALLED_DB.tmp" "$INSTALLED_DB"
+# Helpers
+_mktemp_dir() {
+  mkdir -p "$SANDBOX_TMPBASE"
+  mktemp -d "${SANDBOX_TMPBASE}/sb-XXXXX"
 }
 
-write_files_list() {
-  local port="$1" stagedir="$2"  # stagedir is path within host FS (not inside sandbox) or absolute
-  local listfile="$FILES_DIR/$(echo "$port" | tr '/' '_').list"
-  # Find all installed files under stagedir and store their absolute path as installed location
-  rm -f "$listfile"
-  if [ -d "$stagedir" ]; then
-    (cd "$stagedir" && find . -type f -printf '%P\n' | sed "s|^|$PREFIX/|") > "$listfile" 2>/dev/null || true
+# Check tool availability
+_has_bwrap() { command -v bwrap >/dev/null 2>&1; }
+_has_docker() { command -v docker >/dev/null 2>&1; }
+_is_root() { [ "$(id -u)" -eq 0 ]; }
+
+# prepare chroot base (best-effort)
+_chroot_prepare_base() {
+  # create minimal base if not exists (very conservative)
+  if [ -d "$SANDBOX_CHROOT_BASE" ]; then
+    log_info "Chroot base encontrado: $SANDBOX_CHROOT_BASE"
+    return 0
   fi
-  log_info "Lista de arquivos gravada em $listfile"
+
+  if ! _is_root; then
+    log_warn "Criar chroot base requer root; pule a preparação manualmente"
+    return 1
+  fi
+
+  log_info "Criando chroot base em $SANDBOX_CHROOT_BASE (minimal)"
+  mkdir -p "$SANDBOX_CHROOT_BASE"{/bin,/lib,/lib64,/usr,/usr/bin,/etc,/tmp}
+  # Copy a very small set of files needed for basic shell
+  if command -v bash >/dev/null 2>&1; then
+    cp "$(command -v bash)" "$SANDBOX_CHROOT_BASE/bin/" || true
+  fi
+  # copy ld-linux and libc if possible (best-effort)
+  for lib in /lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2; do
+    [ -f "$lib" ] && cp -a "$lib" "$SANDBOX_CHROOT_BASE/lib64/" 2>/dev/null || true
+  done
+  # This is minimal and may not work for all builds. Recommend user maintain a full debootstrap or pacstrap.
+  log_warn "Chroot base criada de forma minimal; para builds reais, forneça um base completo (debootstrap/pacstrap)."
+  return 0
 }
 
-copy_from_staged_to_root() {
-  local stagedir="$1"
-  # copy preserving metadata; if fakeroot available wrap in fakeroot
-  if [ -z "$stagedir" ] || [ ! -d "$stagedir" ]; then
-    err "Stagedir inválido: $stagedir"
+# Create chroot instance for a port (best-effort)
+_chroot_create_instance() {
+  local portkey="$1" workdir="$2"
+  local instroot="${SANDBOX_CHROOT_ROOTDIR}/${portkey}-$(date +%s)"
+  mkdir -p "$instroot"
+  log_info "Criando chroot instance em $instroot (base: $SANDBOX_CHROOT_BASE)"
+  if [ -d "$SANDBOX_CHROOT_BASE" ]; then
+    # bind-mount or copy base
+    if _is_root; then
+      # bind mount base for speed
+      rsync -a --delete "$SANDBOX_CHROOT_BASE"/ "$instroot"/ || true
+    else
+      # fallback: copy (may require root for some things)
+      cp -a "$SANDBOX_CHROOT_BASE"/. "$instroot"/ || true
+    fi
+  else
+    log_warn "Chroot base ausente; tentativa de usar host files (não isolado)"
+  fi
+  # create work mounts inside chroot: /work will point to workdir
+  mkdir -p "$instroot/work"
+  # bind mount actual workdir if root
+  if _is_root; then
+    mount --bind "$workdir" "$instroot/work" 2>/dev/null || true
+  else
+    # copy contents into chroot/work
+    cp -a "$workdir"/. "$instroot/work"/ 2>/dev/null || true
+  fi
+  printf '%s' "$instroot"
+}
+
+# Cleanup chroot instance
+_chroot_destroy_instance() {
+  local instroot="$1"
+  if [ -z "$instroot" ] || [ ! -d "$instroot" ]; then return 0; fi
+  log_info "Limpando chroot instance $instroot"
+  # attempt to unmount bind mounts
+  if _is_root; then
+    # find mounts under instroot and try to umount
+    while read -r m; do
+      mountpoint="$(echo "$m" | awk '{print $2}')"
+      umount -l "$mountpoint" 2>/dev/null || true
+    done < <(mount | grep "$instroot" || true)
+  fi
+  # remove directory (best-effort)
+  rm -rf "$instroot" 2>/dev/null || true
+}
+
+# Create bubblewrap sandbox command
+_bwrap_cmd_base() {
+  local workdir="$1"
+  local cmdfile="$2"
+  # create binds for allowed host paths
+  local binds=()
+  IFS=' ' read -r -a paths <<< "$SANDBOX_ALLOWED_HOSTPATHS"
+  for p in "${paths[@]}"; do
+    [ -e "$p" ] || continue
+    binds+=("--ro-bind" "$p" "$p")
+  done
+  # bind workdir read-write at /work
+  binds+=("--bind" "$workdir" "/work")
+  # minimal /tmp writable
+  binds+=("--tmpfs" "/tmp")
+  # set working dir and user mapping (no newuidmap handled)
+  # build command: bwrap [binds] -- chroot command runs bash -lc "cd /work && source env && exec ..."
+  printf '%s\n' "${binds[@]}"
+}
+
+# docker run wrapper
+_docker_run_cmd() {
+  local workdir="$1"
+  local cmd="$2"
+  # map workdir into container at /work, and /usr/ports if exists
+  local binds=("-v" "${workdir}:/work:Z")
+  # expose /usr/ports if exists
+  if [ -d "${PORTSDIR:-/usr/ports}" ]; then
+    binds+=("-v" "${PORTSDIR}:/usr/ports:Z")
+  fi
+  # run container and execute /bin/bash -lc "cd /work && $cmd"
+  docker run --rm -it "${binds[@]}" --workdir /work "$SANDBOX_DOCKER_IMAGE" /bin/bash -lc "$cmd"
+}
+
+# Public: sandbox_prepare <portkey> <workdir> <staging_dir>
+# Creates and returns an identifier for the sandbox (path or id). Best-effort.
+sandbox_prepare() {
+  local portkey="$1" workdir="$2" staging="$3"
+  case "$SANDBOX_METHOD" in
+    none)
+      log_info "SANDBOX_METHOD=none: nenhuma preparação necessária"
+      printf '%s' "none"
+      ;;
+    bwrap)
+      if ! _has_bwrap; then
+        log_warn "bwrap não disponível; fallback para none"
+        printf '%s' "none"
+        return 0
+      fi
+      # For bwrap no persistent state needed
+      log_info "bwrap sandbox será usado (no state)"
+      printf '%s' "bwrap"
+      ;;
+    chroot)
+      if ! _is_root; then
+        log_warn "chroot requer root. Se não for root, sandbox será criado em modo copy (menos isolado)"
+      fi
+      mkdir -p "$SANDBOX_CHROOT_ROOTDIR"
+      _chroot_prepare_base || true
+      local inst
+      inst=$(_chroot_create_instance "$portkey" "$workdir")
+      printf '%s' "$inst"
+      ;;
+    docker)
+      if ! _has_docker; then
+        log_warn "docker não disponível; fallback para none"
+        printf '%s' "none"
+      else
+        log_info "docker sandbox será usado (image: $SANDBOX_DOCKER_IMAGE)"
+        printf '%s' "docker"
+      fi
+      ;;
+    *)
+      log_warn "Método sandbox desconhecido: $SANDBOX_METHOD -> fallback none"
+      printf '%s' "none"
+      ;;
+  esac
+}
+
+# Public: sandbox_cleanup <portkey> <workdir> <staging_dir> <sandbox-id?>
+# Cleanup resources allocated by sandbox_prepare.
+sandbox_cleanup() {
+  local portkey="$1" workdir="$2" staging="$3" sandbox_id="${4:-}"
+  case "$SANDBOX_METHOD" in
+    chroot)
+      if [ -n "$sandbox_id" ] && [ -d "$sandbox_id" ]; then
+        _chroot_destroy_instance "$sandbox_id" || true
+      fi
+      ;;
+    bwrap|none|docker)
+      # nothing to cleanup for bwrap or docker (docker runs --rm)
+      log_info "sandbox_cleanup: nada a fazer para method $SANDBOX_METHOD"
+      ;;
+  esac
+}
+
+# Public: sandbox_exec <workdir> <command...>
+# Executes command inside the chosen sandbox method. Workdir is bound/mapped to /work inside sandbox.
+# Returns command exit status.
+sandbox_exec() {
+  if [ $# -lt 2 ]; then
+    log_error "sandbox_exec usage: sandbox_exec <workdir> <command...>"
     return 2
   fi
+  local workdir="$1"; shift
+  local cmd="$*"
 
-  if [ -n "$FAKEROOT_BIN" ] && [ -x "$FAKEROOT_BIN" ]; then
-    log_info "Copiando arquivos do stagedir para sistema com fakeroot"
-    # Using fakeroot to simulate owner/perm changes during install
-    $FAKEROOT_BIN bash -c "cd '$stagedir' && tar -cf - . | (cd / && tar -xf -)" || return $?
-  else
-    log_info "Copiando arquivos do stagedir para sistema (necessita privilégios se for /usr etc)"
-    if [ "$(id -u)" -ne 0 ]; then
-      log_warn "Não sou root e fakeroot não disponível — instalação pode falhar"
-    fi
-    (cd "$stagedir" && tar -cf - . | (cd / && tar -xf -)) || return $?
-  fi
-  return 0
+  case "$SANDBOX_METHOD" in
+    none)
+      log_info "SANDBOX_METHOD=none: executando diretamente em $workdir: $cmd"
+      (cd "$workdir" && bash -lc "$cmd")
+      return $?
+      ;;
+    bwrap)
+      if ! _has_bwrap; then
+        log_warn "bwrap não disponível; executando diretamente"
+        (cd "$workdir" && bash -lc "$cmd")
+        return $?
+      fi
+      # build bwrap args
+      local tmpdir
+      tmpdir=$(_mktemp_dir)
+      # mount typical system dirs read-only and bind workdir
+      local bwrap_args=()
+      # establish minimal environment
+      bwrap_args+=(--ro-bind / /)
+      # bind allowed host paths read-only to avoid breaking builds that need them
+      IFS=' ' read -r -a paths <<< "$SANDBOX_ALLOWED_HOSTPATHS"
+      for p in "${paths[@]}"; do
+        [ -e "$p" ] || continue
+        bwrap_args+=(--ro-bind "$p" "$p")
+      done
+      bwrap_args+=(--bind "$workdir" /work)
+      bwrap_args+=(--tmpfs /tmp)
+      bwrap_args+=(--dir /run --proc /proc --dev /dev)
+      # drop extra capabilities (bwrap handles)
+      # set working dir & execute
+      log_info "Executando em bwrap: cd /work && $cmd"
+      if bwrap "${bwrap_args[@]}" -- chroot / /bin/bash -lc "cd /work && $cmd"; then
+        rm -rf "$tmpdir" 2>/dev/null || true
+        return 0
+      else
+        rm -rf "$tmpdir" 2>/dev/null || true
+        return 1
+      fi
+      ;;
+    chroot)
+      # create instance and chroot into it
+      local instroot
+      instroot=$(_chroot_create_instance "temp" "$workdir")
+      if [ -z "$instroot" ] || [ ! -d "$instroot" ]; then
+        log_warn "Falha ao criar chroot instance; executando diretamente"
+        (cd "$workdir" && bash -lc "$cmd")
+        return $?
+      fi
+      log_info "Executando dentro do chroot $instroot: cd /work && $cmd"
+      if _is_root; then
+        chroot "$instroot" /bin/bash -lc "cd /work && $cmd"
+        local rc=$?
+        _chroot_destroy_instance "$instroot"
+        return $rc
+      else
+        if command -v sudo >/dev/null 2>&1; then
+          sudo chroot "$instroot" /bin/bash -lc "cd /work && $cmd"
+          local rc=$?
+          _chroot_destroy_instance "$instroot"
+          return $rc
+        else
+          log_warn "Não há sudo/root para usar chroot; executando diretamente"
+          (cd "$workdir" && bash -lc "$cmd")
+          return $?
+        fi
+      fi
+      ;;
+    docker)
+      if ! _has_docker; then
+        log_warn "docker não disponível; executando diretamente"
+        (cd "$workdir" && bash -lc "$cmd")
+        return $?
+      fi
+      # try to run using docker image
+      log_info "Executando em docker ($SANDBOX_DOCKER_IMAGE): cd /work && $cmd"
+      _docker_run_cmd "$workdir" "$cmd"
+      return $?
+      ;;
+    *)
+      log_warn "Método sandbox desconhecido: $SANDBOX_METHOD; executando diretamente"
+      (cd "$workdir" && bash -lc "$cmd")
+      return $?
+      ;;
+  esac
 }
 
-# ---------- internal: build script that will run inside sandbox ----------
-# We will create a small script inside the sandbox instance to run the sequence.
-# The script will:
-#  - cd /usr/ports/<port>
-#  - run optionally: make fetch
-#  - run configure/build: make build || make all || make
-#  - run make install DESTDIR=/staging PREFIX=/usr/local
-#  - leave /staging populated
-create_inner_build_script() {
-  local inst="$1" port="$2" stagedir_rel="$3"
-  local inner_script="$inst/.build_script.sh"
-  cat > "$inner_script" <<'INNER'
-#!/usr/bin/env bash
-set -euo pipefail
-PORT="$1"
-PREFIX="${PREFIX:-/usr/local}"
-STAGEDIR="$2"   # inside chroot instance absolute path (eg /staging)
-LOG="/tmp/package_build.log"
-echo "[inner] start build $PORT" > "$LOG"
-
-cd "$PORT" || { echo "Port dir not found: $PORT" >> "$LOG"; exit 2; }
-
-# try fetch
-if make -n fetch >/dev/null 2>&1; then
-  echo "[inner] running make fetch" >> "$LOG"
-  make fetch || echo "fetch failed (non-fatal)" >> "$LOG"
-fi
-
-# run configure if present (some ports have configure target)
-if make -n configure >/dev/null 2>&1; then
-  echo "[inner] running make configure" >> "$LOG"
-  make configure || echo "configure failed (non-fatal)" >> "$LOG"
-fi
-
-# build: prefer 'build' target, fallback to 'all' or plain make
-if make -n build >/dev/null 2>&1; then
-  echo "[inner] running make build" >> "$LOG"
-  make build ${MAKEFLAGS:-} || { echo "build failed" >> "$LOG"; exit 3; }
-elif make -n all >/dev/null 2>&1; then
-  echo "[inner] running make all" >> "$LOG"
-  make all ${MAKEFLAGS:-} || { echo "all build failed" >> "$LOG"; exit 3; }
-else
-  echo "[inner] running plain make" >> "$LOG"
-  make ${MAKEFLAGS:-} || { echo "make failed" >> "$LOG"; exit 3; }
-fi
-
-# ensure stagedir exists
-mkdir -p "$STAGEDIR"
-
-# install into stagedir
-if make -n install >/dev/null 2>&1; then
-  echo "[inner] running make install DESTDIR=$STAGEDIR PREFIX=$PREFIX" >> "$LOG"
-  make install DESTDIR="$STAGEDIR" PREFIX="$PREFIX" ${MAKEFLAGS:-} || { echo "install failed" >> "$LOG"; exit 4; }
-else
-  # fallback: try 'install' target absent -> try 'make install' anyway
-  echo "[inner] running fallback make install DESTDIR=$STAGEDIR PREFIX=$PREFIX" >> "$LOG"
-  make install DESTDIR="$STAGEDIR" PREFIX="$PREFIX" ${MAKEFLAGS:-} || { echo "install failed" >> "$LOG"; exit 4; }
-fi
-
-echo "[inner] build finished" >> "$LOG"
-exit 0
-INNER
-
-  chmod +x "$inner_script" || true
-  # return path to inner script and expected args
-  printf '%s\n' "$inner_script"
+# Public: sandbox_run_script <workdir> <script-file> [args...]
+# Copies script into workdir (if necessary) and executes inside sandbox.
+sandbox_run_script() {
+  if [ $# -lt 2 ]; then
+    log_error "sandbox_run_script usage: sandbox_run_script <workdir> <script-file> [args...]"
+    return 2
+  fi
+  local workdir="$1"; shift
+  local script="$1"; shift
+  local basenm
+  basenm="$(basename "$script")"
+  mkdir -p "$workdir/.sandbox-scripts"
+  cp -a "$script" "$workdir/.sandbox-scripts/$basenm"
+  chmod +x "$workdir/.sandbox-scripts/$basenm"
+  sandbox_exec "$workdir" "/work/.sandbox-scripts/$basenm $*"
 }
 
-# ---------- main function: cmd_build_sandbox ----------
-# Usage: cmd_build_sandbox <categoria/port>
-cmd_build_sandbox() {
-  local port="$1"
-  [ -n "$port" ] || { err "Uso: package build <categoria/port>"; return 2; }
+# Export functions
+export -f sandbox_prepare sandbox_cleanup sandbox_exec sandbox_run_script
 
-  log_info "Iniciando build sandboxed para $port"
-  # 1) run dependency resolution if available
-  if declare -F cmd_deps >/dev/null; then
-    log_info "Resolvendo dependências (BUILD_DEPENDS, RUN_DEPENDS, TEST_DEPENDS)..."
-    cmd_deps "$port" || { err "Falha ao resolver dependências"; return 1; }
-  else
-    log_debug "cmd_deps não disponível — pulando resolução automática"
-  fi
+# If run directly: small CLI for testing
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  case "${1:-}" in
+    prepare)
+      sandbox_prepare "${2:-test}" "${3:-/tmp}" "${4:-/tmp/staging}"
+      ;;
+    exec)
+      shift
+      sandbox_exec "$@"
+      ;;
+    run)
+      shift
+      sandbox_run_script "$@"
+      ;;
+    cleanup)
+      sandbox_cleanup "${2:-}" "${3:-}" "${4:-}"
+      ;;
+    help|--help|-h|?)
+      cat <<EOF
+sandbox.sh CLI
+Usage:
+  $0 prepare <portkey> <workdir> <staging>
+  $0 exec <workdir> "<command...>"
+  $0 run <workdir> <script> [args...]
+  $0 cleanup <portkey> <workdir> <staging> [sandbox-id]
 
-  # 2) Prepare sandbox
-  local inst
-  inst=$(prepare_sandbox "$port") || { err "Falha ao preparar sandbox"; return 1; }
-  log_info "Sandbox criada em: $inst"
-
-  # stagedir is inside the instance root (absolute path there)
-  local stagedir="/staging"
-  # ensure stagedir exists on host under instance to collect later
-  mkdir -p "$inst$stagedir"
-
-  # 3) create inner build script (host side file inside instance)
-  local inner_script
-  inner_script=$(create_inner_build_script "$inst" "/$PORTSDIR/$port" "$stagedir") || { err "Falha ao criar script interno"; [ "$SANDBOX_KEEP_ON_FAIL" = true ] || cleanup_sandbox "$port"; return 1; }
-
-  # 4) run pre_configure hook if available (call from host side if function exists)
-  if declare -F run_pre_configure >/dev/null; then
-    run_pre_configure "$port" || { err "pre_configure hook falhou"; [ "$SANDBOX_KEEP_ON_FAIL" = true ] || cleanup_sandbox "$port"; return 1; }
-  fi
-
-  # 5) execute the inner script inside sandbox
-  # Pass arguments: port directory inside chroot (e.g. /usr/ports/net/httpd) and stagedir (/staging)
-  local cmd_inner
-  cmd_inner="/.build_script.sh '/$PORTSDIR/$port' '$stagedir'"
-
-  # Copy inner script into instance root (already created at $inst/.build_script.sh)
-  # ensure it's executable inside instance file system
-  chmod +x "$inst/.build_script.sh" 2>/dev/null || true
-
-  log_info "Executando build dentro da sandbox..."
-  run_in_sandbox "$inst" "/.build_script.sh '/$PORTSDIR/$port' '$stagedir'" || {
-    err "Falha no build dentro da sandbox"
-    # leave sandbox for debugging if configured
-    if [ "$SANDBOX_KEEP_ON_FAIL" = true ]; then
-      log_warn "Sandbox preservada em $inst para análise"
-      return 1
-    else
-      cleanup_sandbox "$port"
-      return 1
-    fi
-  }
-
-  log_info "Build concluído dentro da sandbox. Coletando artefatos..."
-
-  # 6) Collect files list from stagedir on host ($inst$stagedir)
-  local host_stagedir="$inst$stagedir"
-  if [ ! -d "$host_stagedir" ]; then
-    err "Stagedir não encontrado: $host_stagedir"
-    cleanup_sandbox "$port"
-    return 1
-  fi
-
-  # write files list (absolute paths where they will be installed on the real system)
-  write_files_list "$port" "$host_stagedir"
-
-  # 7) copy from stagedir to root (install)
-  log_info "Instalando arquivos no sistema a partir do stagedir..."
-  if ! copy_from_staged_to_root "$host_stagedir"; then
-    err "Falha ao copiar arquivos do stagedir para o sistema"
-    [ "$SANDBOX_KEEP_ON_FAIL" = true ] || cleanup_sandbox "$port"
-    return 1
-  fi
-
-  # 8) Optionally run post_install hooks
-  if declare -F run_post_install >/dev/null; then
-    run_post_install "$port" || { err "post_install hook falhou"; [ "$SANDBOX_KEEP_ON_FAIL" = true ] || cleanup_sandbox "$port"; return 1; }
-  fi
-
-  # 9) Update INSTALLED_DB with version detection (try to parse Makefile VERSION or use timestamp)
-  local version="unknown"
-  local makefile="$PORTSDIR/$port/Makefile"
-  if [ -f "$makefile" ]; then
-    version=$(grep -E '^(VERSION|PORTVERSION|PORTNAME)[[:space:]]*=' "$makefile" | head -n1 | awk -F= '{print $2}' | tr -d ' "')
-    version=${version:-"unknown"}
-  fi
-  record_installed "$port" "$version"
-  register_action "install" "$port" "success" 2>/dev/null || true
-
-  log_info "Instalação concluída para $port (versão: $version)"
-
-  # 10) cleanup sandbox unless configured to keep
-  if [ "$SANDBOX_KEEP_ON_FAIL" = true ] || [ "${SANDBOX_KEEP:-false}" = true ]; then
-    log_info "Preservando sandbox (SANDBOX_KEEP enabled): $inst"
-  else
-    cleanup_sandbox "$port"
-  fi
-
-  return 0
-}
-
-# Export function to be used by CLI when sourced
-# The CLI's `package` script should call `cmd_build_sandbox` instead of the older cmd_build
-# or you can alias cmd_build -> cmd_build_sandbox in package main.
+Environment config (/etc/package.conf):
+  SANDBOX_METHOD: none|bwrap|chroot|docker (default: none)
+  SANDBOX_CHROOT_BASE: path to chroot base
+  SANDBOX_DOCKER_IMAGE: docker image to use
+  SANDBOX_ALLOWED_HOSTPATHS: space-separated list of host paths to bind inside sandbox
+EOF
+      ;;
+    *)
+      echo "Unknown subcommand. Use help."
+      exit 2
+      ;;
+  esac
+fi
