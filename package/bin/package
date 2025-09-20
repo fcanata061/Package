@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # /opt/package/bin/package
-# CLI principal - esqueleto
+# CLI principal atualizado com suporte a módulos, abreviaturas, e coloração
+
 set -euo pipefail
 IFS=$'\n\t'
 
-# Carrega configuração
+# ---- Configuração padrão ----
 CONFIG_FILE=/etc/package.conf
 if [ -f "$CONFIG_FILE" ]; then
   # shellcheck disable=SC1090
@@ -15,47 +16,188 @@ MODULEDIR=${MODULEDIR:-/opt/package/modules}
 PORTSDIR=${PORTSDIR:-/usr/ports}
 PREFIX=${PREFIX:-/usr/local}
 
-log() { echo "[package] $*"; }
-err() { echo "[package] ERROR: $*" >&2; }
+# ---- Coloração ANSI ----
+# Verifica se saída é TTY
+if [ -t 1 ]; then
+  COLOR_RESET="\033[0m"
+  COLOR_RED="\033[31m"
+  COLOR_GREEN="\033[32m"
+  COLOR_YELLOW="\033[33m"
+  COLOR_CYAN="\033[36m"
+else
+  COLOR_RESET=""
+  COLOR_RED=""
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_CYAN=""
+fi
 
-# carrega todos os módulos (.sh) do diretório MODULEDIR
+log() {
+  echo -e "${COLOR_CYAN}[package]${COLOR_RESET} $*"
+}
+
+info() {
+  echo -e "${COLOR_GREEN}[INFO]${COLOR_RESET} $*"
+}
+
+warn() {
+  echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"
+}
+
+err() {
+  echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2
+}
+
+# ---- Carrega todos os módulos ----
 load_modules() {
   if [ -d "$MODULEDIR" ]; then
     for m in "$MODULEDIR"/*.sh; do
-      # shellcheck disable=SC1090
-      [ -r "$m" ] && source "$m"
+      if [ -r "$m" ]; then
+        # shellcheck disable=SC1090
+        source "$m"
+      fi
     done
   fi
 }
 
+# ---- Uso / help ----
 usage() {
   cat <<EOF
-Uso: package <comando> [opções]
-Comandos:
-  fetch <categoria/port>   - baixa fontes do port
-  build  <categoria/port>  - compila o port
-  install <categoria/port> - instala no PREFIX
-  service <nome> <action>  - gerencia systemd para um package instalado (ex: start/stop/restart/enable)
-  list <categoria>         - lista ports
-  help                     - mostra essa ajuda
+${COLOR_CYAN}Uso:${COLOR_RESET} package [comando] [porta] [opções]
+
+Comandos disponíveis:
+  fetch, f           - baixa fontes do port
+  build, b           - compila o port
+  install, i         - instala o port
+  remove, rm, r      - remove o port
+  upgrade, up, u     - atualiza o port
+  deps, d            - mostra/resolva dependências
+  update, upd        - verifica versões novas de todos os ports
+  list, ls           - lista ports instalados ou disponíveis
+  service, srv       - gerencia systemd (start/stop/enable/disable/etc.)
+  help, h            - mostra esta ajuda
+
+Exemplos:
+  package build editors/vim
+  package up gcc
+  package deps net/httpd
+  package upd           # verifica updates
 EOF
 }
 
-main() {
-  if [ $# -lt 1 ]; then
-    usage; exit 1
-  fi
-  cmd=$1; shift
-  load_modules
+# ---- Mapeamento de abreviaturas ----
+resolve_cmd() {
+  local cmd="$1"
   case "$cmd" in
-    fetch)  cmd_fetch "$@" ;;    # definido em modules/fetch.sh
-    build)  cmd_build "$@" ;;    # definido em modules/build.sh
-    install) cmd_install "$@" ;;  # definido em modules/install.sh
-    service) cmd_service "$@" ;;  # definido em modules/service.sh
-    list) cmd_list "$@" ;;
-    help|--help|-h) usage ;;
-    *) err "Comando desconhecido: $cmd"; usage; exit 2 ;;
+    f|fetch)          echo "fetch" ;;
+    b|build)          echo "build" ;;
+    i|install)        echo "install" ;;
+    r|rm|remove)      echo "remove" ;;
+    u|up|upgrade)     echo "upgrade" ;;
+    d|deps)           echo "deps" ;;
+    upd|update)       echo "update" ;;
+    ls|list)          echo "list" ;;
+    srv|service)      echo "service" ;;
+    h|help|--help)    echo "help" ;;
+    *)                echo "$cmd" ;;
   esac
 }
 
+# ---- Execução principal ----
+main() {
+  if [ $# -lt 1 ]; then
+    usage
+    exit 1
+  fi
+
+  local cmd_orig="$1"; shift
+  local cmd=$(resolve_cmd "$cmd_orig")
+
+  load_modules
+
+  case "$cmd" in
+    fetch)
+      if declare -F cmd_fetch >/dev/null; then
+        cmd_fetch "$@"
+      else
+        err "Comando fetch não implementado."
+        exit 2
+      fi
+      ;;
+    build)
+      if declare -F cmd_build >/null 2>&1; then
+        cmd_build "$@"
+      else
+        err "Comando build não implementado."
+        exit 2
+      fi
+      ;;
+    install)
+      if declare -F cmd_install >/dev/null 2>&1; then
+        cmd_install "$@"
+      else
+        err "Comando install não implementado."
+        exit 2
+      fi
+      ;;
+    remove)
+      if declare -F cmd_remove >/dev/null 2>&1; then
+        cmd_remove "$@"
+      else
+        err "Comando remove não implementado."
+        exit 2
+      fi
+      ;;
+    upgrade)
+      if declare -F cmd_upgrade >/dev/null 2>&1; then
+        cmd_upgrade "$@"
+      else
+        err "Comando upgrade não implementado."
+        exit 2
+      fi
+      ;;
+    deps)
+      if declare -F cmd_deps >/dev/null 2>&1; then
+        cmd_deps "$@"
+      else
+        err "Comando deps não implementado."
+        exit 2
+      fi
+      ;;
+    update)
+      if declare -F cmd_update >/dev/null 2>&1; then
+        cmd_update "$@"
+      else
+        err "Comando update não implementado."
+        exit 2
+      fi
+      ;;
+    list)
+      if declare -F cmd_list >/dev/null 2>&1; then
+        cmd_list "$@"
+      else
+        err "Comando list não implementado."
+        exit 2
+      fi
+      ;;
+    service)
+      if declare -F cmd_service >/dev/null 2>&1; then
+        cmd_service "$@"
+      else
+        err "Comando service não implementado."
+        exit 2
+      fi
+      ;;
+    help)
+      usage
+      ;;
+    *)
+      err "Comando desconhecido: $cmd_orig"
+      usage
+      exit 2
+      ;;
+  esac
+}
+
+# ---- Inicia CLI ----
 main "$@"
