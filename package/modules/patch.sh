@@ -1,85 +1,79 @@
 #!/usr/bin/env bash
-# modules/patch.sh
-# --- Aplicação de patches em ports ---
-#
-# Estrutura esperada:
-#   /usr/ports/<categoria>/<port>/patches/*.patch
-#   /usr/ports/<categoria>/<port>/patches/*.diff
-#
-# Funções:
-#   patch_apply <port_path> <srcdir>
-#   patch_list <port_path>
-#   patch_clean <port_path>
-#
-# Integração: deve ser chamado dentro do build.sh,
-# após extrair o tarball mas antes de rodar ./configure.
+# patch.sh - módulo para aplicar patches em fontes
+# Integra-se com build.sh e hooks.sh
 
-PORTSDIR=${PORTSDIR:-/usr/ports}
-PATCH_LOG_DIR=${PATCH_LOG_DIR:-/var/log/package/patches}
-mkdir -p "$PATCH_LOG_DIR"
+set -euo pipefail
+IFS=$'\n\t'
 
-: "${log_info:=:}"
-: "${log_warn:=:}"
-: "${log_error:=:}"
+MODULE_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+LOG_DIR=${LOG_DIR:-/var/log/package}
+PATCH_DIR=${PATCH_DIR:-patches}
 
-if ! declare -F log_info >/dev/null; then log_info(){ echo "[patch][INFO] $*"; }; fi
-if ! declare -F log_warn >/dev/null; then log_warn(){ echo "[patch][WARN] $*"; }; fi
-if ! declare -F log_error >/dev/null; then log_error(){ echo "[patch][ERROR] $*" >&2; }; fi
+mkdir -p "$LOG_DIR"
 
-# -----------------------------------------------------------------------------
-# Listar patches disponíveis para um port
-# -----------------------------------------------------------------------------
-patch_list() {
-  local port_path="$1"
-  local patchdir="$PORTSDIR/$port_path/patches"
+if ! declare -F log_info >/dev/null 2>&1; then
+  log_info(){ echo "[patch][INFO] $*"; }
+fi
+if ! declare -F log_warn >/dev/null 2>&1; then
+  log_warn(){ echo "[patch][WARN] $*"; }
+fi
+if ! declare -F log_error >/dev/null 2>&1; then
+  log_error(){ echo "[patch][ERROR] $*" >&2; }
+fi
 
-  if [ -d "$patchdir" ]; then
-    find "$patchdir" -type f \( -name "*.patch" -o -name "*.diff" \) | sort
+# Aplica um patch a partir de um arquivo em um diretório de build
+# Usage: apply_patch FILE BUILD_DIR
+apply_patch(){
+  local file="$1" builddir="$2"
+  if [ -z "$file" ] || [ -z "$builddir" ]; then
+    log_error "apply_patch: uso: apply_patch FILE BUILD_DIR"; return 2
   fi
+  if [ ! -f "$file" ]; then
+    log_error "Patch não encontrado: $file"; return 1
+  fi
+  if [ ! -d "$builddir" ]; then
+    log_error "Diretório de build não existe: $builddir"; return 1
+  fi
+
+  log_info "Aplicando patch: $file"
+  (cd "$builddir" && patch -p1 -N -r - < "$file")
 }
 
-# -----------------------------------------------------------------------------
-# Aplicar patches
-# -----------------------------------------------------------------------------
-patch_apply() {
-  local port_path="$1"
-  local srcdir="$2"
+# Aplica lista de patches (array ou lista de caminhos)
+# Usage: apply_patches BUILD_DIR PATCH1 [PATCH2 ...]
+apply_patches(){
+  local builddir="$1"; shift
+  if [ -z "$builddir" ]; then
+    log_error "apply_patches: uso: apply_patches BUILD_DIR PATCHES..."; return 2
+  fi
+  if [ ! -d "$builddir" ]; then
+    log_error "Diretório de build não existe: $builddir"; return 1
+  fi
 
-  local patchdir="$PORTSDIR/$port_path/patches"
-  [ -d "$srcdir" ] || { log_error "Diretório fonte inválido: $srcdir"; return 2; }
+  for patch in "$@"; do
+    # Se patch for relativo, procurar em PATCH_DIR
+    if [ ! -f "$patch" ]; then
+      if [ -f "$PATCH_DIR/$patch" ]; then
+        patch="$PATCH_DIR/$patch"
+      elif [ -f "$MODULE_DIR/../$PATCH_DIR/$patch" ]; then
+        patch="$MODULE_DIR/../$PATCH_DIR/$patch"
+      fi
+    fi
+    apply_patch "$patch" "$builddir"
+  done
+}
 
-  local patches
-  patches=$(patch_list "$port_path")
-
-  if [ -z "$patches" ]; then
-    log_info "Nenhum patch encontrado para $port_path"
+# Função de alto nível para build.sh: aplica PATCHES definidos no Makefile/config
+# Usage: patch_source BUILD_DIR "${PATCHES[@]}"
+patch_source(){
+  local builddir="$1"; shift
+  local patches=("$@")
+  if [ ${#patches[@]} -eq 0 ]; then
+    log_info "Nenhum patch definido para aplicar"
     return 0
   fi
-
-  log_info "Aplicando patches de $port_path"
-  local logfile="$PATCH_LOG_DIR/$(echo "$port_path" | tr '/' '_').log"
-  rm -f "$logfile"
-
-  for patchfile in $patches; do
-    log_info "Aplicando $(basename "$patchfile")"
-    if patch -d "$srcdir" -p1 < "$patchfile" >>"$logfile" 2>&1; then
-      log_info "Patch $(basename "$patchfile") aplicado com sucesso"
-    else
-      log_error "Falha ao aplicar $(basename "$patchfile"), verifique $logfile"
-      return 1
-    fi
-  done
-
-  log_info "Todos os patches aplicados com sucesso em $port_path"
-  return 0
+  log_info "Aplicando patches em $builddir: ${patches[*]}"
+  apply_patches "$builddir" "${patches[@]}"
 }
 
-# -----------------------------------------------------------------------------
-# Limpar logs de patches de um port
-# -----------------------------------------------------------------------------
-patch_clean() {
-  local port_path="$1"
-  local logfile="$PATCH_LOG_DIR/$(echo "$port_path" | tr '/' '_').log"
-  rm -f "$logfile"
-  log_info "Logs de patches limpos para $port_path"
-}
+export -f apply_patch apply_patches patch_source
