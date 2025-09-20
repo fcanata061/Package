@@ -1,110 +1,128 @@
 #!/usr/bin/env bash
-# modules/remove.sh
-#
-# Remove pacotes instalados.
-# Usa manifest.json para saber os arquivos e move tudo para a lixeira
-# em vez de deletar diretamente.
-#
-# Fluxo:
-#   1. Localiza manifest JSON no DBDIR
-#   2. Executa hooks pre-remove
-#   3. Move arquivos para trashdir
-#   4. Desativa serviços (systemd)
-#   5. Executa hooks post-remove
-#   6. Remove do banco de pacotes
+# package/modules/remove.sh (revisado)
+# Módulo “remove” para o gerenciador “package”
+# - Remove arquivos instalados de um pacote dado seu portkey ou category/name
+# - Usa registro (register.sh) para saber quais arquivos remover
+# - Usa fakeroot/sandbox quando disponível
+# - Atualiza base de registro removendo o pacote
+# - Expõe: cmd_remove, remove_port
 
 set -euo pipefail
 
-[ -f /etc/package.conf ] && source /etc/package.conf
+[ -f /etc/package.conf ] && source /etc/package.conf || true
 
-DBDIR=${DBDIR:-/var/lib/package/db}
-LOGDIR=${LOGDIR:-/var/log/package}
-TRASHDIR=${TRASHDIR:-/var/lib/package/trash}
-mkdir -p "$DBDIR" "$LOGDIR" "$TRASHDIR"
+PORTSDIR=${PORTSDIR:-/usr/ports}
+FILES_DIR=${FILES_DIR:-/var/lib/package/files}
+REGISTRY_DIR=${REGISTRY_DIR:-/var/lib/package/registry}
+LOG_DIR=${LOG_DIR:-/var/log/package}
+PREFIX=${PREFIX:-/usr/local}
 
-# --- Logging ---
+mkdir -p "$FILES_DIR" "$REGISTRY_DIR" "$LOG_DIR"
+
+# Logging
 : "${log_info:=:}"
 : "${log_warn:=:}"
 : "${log_error:=:}"
+: "${log_event:=:}"
 
-if ! declare -F log_info >/dev/null; then
-  log_info(){ echo "[remove][INFO] $*"; }
+if ! declare -F log_info >/dev/null; then log_info(){ echo "[remove][INFO] $*"; }; fi
+if ! declare -F log_warn >/dev/null; then log_warn(){ echo "[remove][WARN] $*"; }; fi
+if ! declare -F log_error >/dev/null; then log_error(){ echo "[remove][ERROR] $*"; }; fi
+if ! declare -F log_event >/dev/null; then log_event(){ :; }; fi
+
+# Carrega módulos auxiliares
+MODULE_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+[ -f "$MODULE_DIR/register.sh" ] && source "$MODULE_DIR/register.sh"
+[ -f "$MODULE_DIR/fakeroot.sh" ] && source "$MODULE_DIR/fakeroot.sh"
+[ -f "$MODULE_DIR/sandbox.sh" ] && source "$MODULE_DIR/sandbox.sh"
+
+# Fallbacks se funções não existirem
+if ! declare -F sandbox_exec >/null 2>&1; then
+  sandbox_exec(){ bash -c "$*"; }
 fi
-if ! declare -F log_warn >/dev/null; then
-  log_warn(){ echo "[remove][WARN] $*"; }
-fi
-if ! declare -F log_error >/dev/null; then
-  log_error(){ echo "[remove][ERROR] $*" >&2; }
-fi
 
-# --- Dependências internas ---
-MODULESDIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
-source "$MODULESDIR/hooks.sh"
-source "$MODULESDIR/logs.sh"
-source "$MODULESDIR/service.sh"
-
-# --- Função principal ---
-remove_package() {
-  local name="$1" version="${2:-}"
-
-  # Localizar manifest
-  local manifest
-  if [ -n "$version" ]; then
-    manifest="$DBDIR/$name-$version.manifest.json"
-  else
-    manifest=$(ls "$DBDIR"/"$name"-*.manifest.json 2>/dev/null | sort -V | tail -n1 || true)
-  fi
-
-  [ -f "$manifest" ] || {
-    log_error "Manifest não encontrado para $name"
+# Função para remover usando fakeroot dentro de sandbox quando possível
+_remove_files_list() {
+  local listfile="$1"
+  if [ ! -f "$listfile" ]; then
+    log_error "Arquivo de lista de arquivos para remoção não encontrado: $listfile"
     return 1
-  }
-
-  version=$(jq -r .version "$manifest")
-  log_info "=== Removendo $name-$version ==="
-  log_event "remove" "$name" "$version" "start"
-
-  # Hooks pre-remove
-  run_hook pre-remove "$name"
-
-  # Criar diretório de lixeira
-  local trash="$TRASHDIR/${name}-${version}-$(date +%s)"
-  mkdir -p "$trash"
-
-  # Desativar serviços
-  if [ -d "/etc/systemd/system" ]; then
-    log_info "Desativando serviços do $name"
-    systemctl disable "$name"*.service 2>/dev/null || true
-    systemctl stop "$name"*.service 2>/dev/null || true
   fi
 
-  # Mover arquivos para trash
-  jq -r '.files[]' "$manifest" | while read -r f; do
-    if [ -f "$f" ] || [ -d "$f" ]; then
-      local dest="$trash$f"
-      mkdir -p "$(dirname "$dest")"
-      mv "$f" "$dest" || log_warn "Falha ao mover $f"
+  while IFS= read -r f; do
+    # f começa com “/…” conforme lista de arquivos
+    local abs="$PREFIX${f#/}"  # ou se lista já for absoluta, ajustar
+    if [ -e "$abs" ]; then
+      log_info "Removendo: $abs"
+      rm -f "$abs" || log_warn "Falha ao remover $abs"
+    else
+      log_warn "Arquivo não existe (pulando): $abs"
     fi
-  done
-
-  # Hooks post-remove
-  run_hook post-remove "$name"
-
-  # Remover manifest e registro do banco
-  rm -f "$manifest"
-  log_info "Registro de $name-$version removido"
-
-  log_event "remove" "$name" "$version" "success"
-  log_info "Remoção concluída. Arquivos movidos para $trash"
+  done < "$listfile"
+  return 0
 }
 
-export -f remove_package
+remove_port() {
+  local portkey="$1"
 
-# Execução direta
+  [ -n "$portkey" ] || { log_error "Uso: remove_port <portkey>"; return 2; }
+
+  local meta_file="${REGISTRY_DIR}/${portkey}.json"
+  if [ ! -f "$meta_file" ]; then
+    log_error "Pacote não registrado: $portkey"
+    return 1
+  fi
+
+  # extrai version e files_list do meta
+  local portver files_list
+  portver=$(grep '"version"' "$meta_file" | sed -E 's/.*: *"([^"]+)".*/\1/') || portver="unknown"
+  files_list=$(grep '"files_list"' "$meta_file" | sed -E 's/.*: *"([^"]+)".*/\1/') || { log_error "Não achei files_list no registro"; return 1; }
+
+  log_info "=== Iniciando remoção: $portkey v$portver ==="
+  log_event "remove" "$portkey" "$portver" "start"
+
+  # uso de sandbox/fakeroot para remover
+  if declare -F fakeroot >/dev/null 2>&1; then
+    log_info "Usando fakeroot para remoção"
+    if [ "${SANDBOX_METHOD:-none}" != "none" ]; then
+      log_info "Dentro de sandbox ($SANDBOX_METHOD)"
+      sandbox_exec "fakeroot _remove_files_list '$files_list'"
+    else
+      fakeroot _remove_files_list "$files_list"
+    fi
+  else
+    log_warn "fakeroot não disponível; removendo diretamente (pode exigir privilégios)"
+    _remove_files_list "$files_list"
+  fi
+
+  # Remover registro JSON
+  rm -f "$meta_file" || log_warn "Falha ao remover meta_file $meta_file"
+
+  # Também remover arquivo de lista (se quiser)
+  if [ -f "$files_list" ]; then
+    rm -f "$files_list" || log_warn "Falha ao remover lista de arquivos $files_list"
+  fi
+
+  log_info "Remoção concluída para $portkey"
+  log_event "remove" "$portkey" "$portver" "success"
+
+  return 0
+}
+
+cmd_remove() {
+  local port="$1"
+  [ -n "$port" ] || { log_error "Uso: package remove <portkey>"; return 2; }
+  # se usar category/name em vez de portkey, pode converter
+  local portkey="${port//\//_}"
+  remove_port "$portkey"
+}
+
+export -f cmd_remove remove_port
+
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   if [ $# -lt 1 ]; then
-    echo "Uso: $0 <nome> [versão]"
+    echo "Uso: $0 <portkey> | <category/name>" >&2
     exit 1
   fi
-  remove_package "$@"
+  cmd_remove "$1"
 fi
