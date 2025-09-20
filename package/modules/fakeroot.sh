@@ -1,143 +1,136 @@
 #!/usr/bin/env bash
-# modules/fakeroot.sh
-#
-# Fornece funções para instalação sob ambiente "fakeroot",
-# preservando metadados (uid, gid, permissões).
-#
-# Exporta:
-#   run_under_fakeroot <cmd...>
-#   fakeroot_install_from_staging <staging_dir> <port>
-#   fakeroot_create_tarball <staging_dir> [out.tar]
-#
-# Lê variáveis de /etc/package.conf:
-#   FAKEROOT_TOOL (fakeroot|fakechroot|rsync|tar)
-#   PREFIX (/usr/local por padrão)
-#   TRASH_DIR (/var/lib/package/trash por padrão)
-#   UMASK (0022 por padrão)
-#   RSYNC_CMD, TAR_CMD
+# fakeroot.sh - módulo para empacotar e instalar staging usando fakeroot
+# Fornece funções:
+# - create_package_from_staging STAGING OUT_TARBALL
+# - fakeroot_install_from_staging STAGING PORTKEY
+# - install_package PACKAGE_PATH
 
 set -euo pipefail
+IFS=$'\n\t'
 
-[ -f /etc/package.conf ] && source /etc/package.conf
+MODULE_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+LOG_DIR=${LOG_DIR:-/var/log/package}
+PACKAGES_DIR=${PACKAGES_DIR:-/var/cache/package/packages}
+REAL_INSTALL=${REAL_INSTALL:-no}   # if yes, attempt to install to system using sudo/rsync
 
-FAKEROOT_TOOL=${FAKEROOT_TOOL:-fakeroot}
-PREFIX=${PREFIX:-/usr/local}
-TRASH_DIR=${TRASH_DIR:-/var/lib/package/trash}
-UMASK=${UMASK:-0022}
-RSYNC_CMD=${RSYNC_CMD:-rsync}
-TAR_CMD=${TAR_CMD:-tar}
+mkdir -p "$LOG_DIR" "$PACKAGES_DIR"
 
-# --- Logging helpers ---
-: "${log_info:=:}"
-: "${log_warn:=:}"
-: "${log_error:=:}"
-
-if ! declare -F log_info >/dev/null; then
+if ! declare -F log_info >/dev/null 2>&1; then
   log_info(){ echo "[fakeroot][INFO] $*"; }
 fi
-if ! declare -F log_warn >/dev/null; then
+if ! declare -F log_warn >/dev/null 2>&1; then
   log_warn(){ echo "[fakeroot][WARN] $*"; }
 fi
-if ! declare -F log_error >/dev/null; then
+if ! declare -F log_error >/dev/null 2>&1; then
   log_error(){ echo "[fakeroot][ERROR] $*" >&2; }
 fi
 
-# --- Funções ---
-
-# run_under_fakeroot <cmd...>
-# Executa comando sob fakeroot/fakechroot se disponível.
-run_under_fakeroot() {
-  if [ $# -lt 1 ]; then
-    log_error "Uso: run_under_fakeroot <comando>"
-    return 2
+# Verifica se fakeroot está disponível
+_check_fakeroot(){
+  if command -v fakeroot >/dev/null 2>&1; then
+    return 0
   fi
+  return 1
+}
 
-  if command -v "$FAKEROOT_TOOL" >/dev/null 2>&1; then
-    case "$FAKEROOT_TOOL" in
-      fakeroot)
-        log_info "Executando sob fakeroot: $*"
-        fakeroot -- "$@"
-        ;;
-      fakechroot)
-        log_info "Executando sob fakechroot: $*"
-        fakechroot "$@"
-        ;;
-      *)
-        log_warn "Ferramenta $FAKEROOT_TOOL não reconhecida, executando diretamente."
-        "$@"
-        ;;
-    esac
+# Cria um tarball (gzip) do staging preservando metadata (perm/uid/gid) usando fakeroot
+# Usage: create_package_from_staging /path/to/staging /path/to/out.tar.gz
+create_package_from_staging(){
+  local staging="$1" out="$2"
+  if [ -z "$staging" ] || [ -z "$out" ]; then
+    log_error "create_package_from_staging: uso: create_package_from_staging STAGING OUT_TARBALL"; return 2
+  fi
+  if [ ! -d "$staging" ]; then
+    log_error "Staging não existe: $staging"; return 1
+  fi
+  mkdir -p "$(dirname "$out")"
+  if _check_fakeroot; then
+    log_info "Criando tarball de pacote com fakeroot: $out"
+    fakeroot sh -c "cd '$staging' && tar --numeric-owner -cpf - ." | gzip -9 > "$out"
+    log_info "Pacote criado: $out"
+    return 0
   else
-    log_warn "Ferramenta fakeroot não encontrada, executando diretamente (pode requerer sudo): $*"
-    "$@"
+    log_warn "fakeroot não disponível; criando tarball sem fakeroot (perms/owners poderão variar)"
+    (cd "$staging" && tar -cpf - .) | gzip -9 > "$out"
+    log_info "Pacote criado (sem fakeroot): $out"
+    return 0
   fi
 }
 
-# fakeroot_install_from_staging <staging_dir> <port>
-# Copia arquivos de staging para / preservando metadados.
-fakeroot_install_from_staging() {
-  local staging="$1" port="$2"
+# Instala staging no sistema. Comportamento:
+# - se REAL_INSTALL=yes tentamos aplicar ao sistema com sudo rsync (requer senha)
+# - caso contrário, empacotamos o staging em PACKAGES_DIR e retornamos o caminho
+# Usage: fakeroot_install_from_staging /path/to/staging portkey
+fakeroot_install_from_staging(){
+  local staging="$1" portkey="$2"
+  if [ -z "$staging" ] || [ -z "$portkey" ]; then
+    log_error "fakeroot_install_from_staging: uso: fakeroot_install_from_staging STAGING PORTKEY"; return 2
+  fi
+  if [ ! -d "$staging" ]; then
+    log_error "staging não existe: $staging"; return 1
+  fi
 
-  [ -d "$staging" ] || {
-    log_error "Diretório staging não existe: $staging"
-    return 1
-  }
+  local ts=$(date +%Y%m%d%H%M%S)
+  local pkgname="${portkey}-${ts}.tar.gz"
+  local pkgpath="$PACKAGES_DIR/$pkgname"
 
-  log_info "Instalando port $port de staging ($staging) para /"
-
-  local tmp_archive
-  tmp_archive="$(mktemp --tmpdir package-staging-XXXXXX.tar)" \
-    || tmp_archive="/tmp/package-staging-$$.tar"
-
-  (cd "$staging" && $TAR_CMD --numeric-owner -cf "$tmp_archive" .) \
-    || { log_error "Falha ao criar tar do staging"; rm -f "$tmp_archive"; return 1; }
-
-  if [ "$(id -u)" -eq 0 ]; then
-    (cd / && $TAR_CMD --numeric-owner -xf "$tmp_archive") \
-      || { log_error "Falha na extração como root"; rm -f "$tmp_archive"; return 1; }
-  else
-    if command -v sudo >/dev/null 2>&1; then
-      sudo env UMASK="$UMASK" sh -c "cd / && $TAR_CMD --numeric-owner -xf '$tmp_archive'" \
-        || { log_error "Falha na extração via sudo"; rm -f "$tmp_archive"; return 1; }
+  if [ "$REAL_INSTALL" = "yes" ]; then
+    log_info "REAL_INSTALL=yes: aplicando staging diretamente no sistema (requer sudo)"
+    if command -v rsync >/dev/null 2>&1; then
+      if [ "$(id -u)" -ne 0 ]; then
+        if command -v sudo >/dev/null 2>&1; then
+          log_info "Usando sudo rsync para copiar arquivos para /"
+          sudo rsync -a --no-o --no-g "$staging"/ / || { log_error "sudo rsync falhou"; return 1; }
+          log_info "Instalação direta concluída via rsync"
+          return 0
+        else
+          log_error "REAL_INSTALL requerido mas sudo não disponível"
+          return 1
+        fi
+      else
+        rsync -a "$staging"/ / || { log_error "rsync falhou"; return 1; }
+        log_info "Instalação direta concluída (root)"
+        return 0
+      fi
     else
-      log_error "Necessário root ou sudo para instalar em /"
-      rm -f "$tmp_archive"
+      log_error "rsync não disponível; não é possível instalar diretamente"
       return 1
     fi
   fi
 
-  rm -f "$tmp_archive"
-  log_info "Instalação de $port concluída com sucesso"
+  # Caso padrão: empacotar em PACKAGES_DIR usando fakeroot para preservar metadados
+  create_package_from_staging "$staging" "$pkgpath" || { log_error "Falha ao criar pacote"; return 1; }
+  log_info "Pacote gerado em: $pkgpath"
+  # Também gerar um índice simples
+  echo "$pkgpath" >> "$PACKAGES_DIR/INDEX" || true
+  echo "$pkgpath"
+  return 0
 }
 
-# fakeroot_create_tarball <staging_dir> [out.tar]
-# Cria tarball preservando donos/permissões.
-fakeroot_create_tarball() {
-  local staging="$1" out="${2:-}"
-  [ -d "$staging" ] || {
-    log_error "Staging não existe: $staging"
-    return 1
-  }
-  [ -z "$out" ] && out="${staging%/}.tar"
-
-  (cd "$staging" && $TAR_CMD --numeric-owner -cf "$out" .) \
-    || { log_error "Falha ao criar tarball $out"; return 1; }
-
-  log_info "Tarball criado: $out"
-  printf '%s\n' "$out"
+# Instala um pacote .tar.gz gerado por create_package_from_staging
+# Usage: install_package /path/to/pkg.tar.gz
+install_package(){
+  local pkg="$1"
+  if [ -z "$pkg" ]; then
+    log_error "install_package: uso: install_package PACKAGE_PATH"; return 2
+  fi
+  if [ ! -f "$pkg" ]; then
+    log_error "Pacote não encontrado: $pkg"; return 1
+  fi
+  log_info "Instalando pacote: $pkg"
+  if [ "$(id -u)" -eq 0 ]; then
+    gzip -dc "$pkg" | tar --numeric-owner -xpf - -C / || { log_error "tar falhou"; return 1; }
+    log_info "Instalação concluída (root)"
+    return 0
+  fi
+  # Se não root, tentar sudo tar
+  if command -v sudo >/dev/null 2>&1; then
+    gzip -dc "$pkg" | sudo tar --numeric-owner -xpf - -C / || { log_error "sudo tar falhou"; return 1; }
+    log_info "Instalação concluída via sudo"
+    return 0
+  fi
+  log_error "Não é root e sudo não disponível — não é possível instalar pacote"
+  return 1
 }
 
-# --- Export ---
-export -f run_under_fakeroot fakeroot_install_from_staging fakeroot_create_tarball
-
-# Execução direta → help
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  cat <<EOF
-Uso: source este módulo ou chame funções exportadas.
-
-Funções disponíveis:
-  run_under_fakeroot <cmd...>
-  fakeroot_install_from_staging <staging_dir> <port>
-  fakeroot_create_tarball <staging_dir> [out.tar]
-EOF
-fi
+export -f create_package_from_staging fakeroot_install_from_staging install_package
