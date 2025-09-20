@@ -144,3 +144,13 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
   fi
   fetch_sources "$1"
 fi
+
+# --- Integração com o bin/package ---
+cmd_fetch() {
+  local port="$1"
+  if [ -z "$port" ]; then
+    log_error "uso: package fetch <portdir>"
+    return 2
+  fi
+  fetch_sources "$PORTSDIR/$port"
+}
