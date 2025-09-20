@@ -1,29 +1,60 @@
 #!/usr/bin/env bash
-# build.sh - módulo evoluído e funcional para gerenciador de pacotes
-# Objetivo: construir um "port" (diretório com Makefile) em sandbox, executar hooks,
-# instalar em staging com DESTDIR e fornecer staging path como saída.
-# Exporta as funções: cmd_build, build_port
+# build.advanced.sh - versão evoluída e completa do módulo build
+# Pipeline: fetch -> verify -> extract -> patch -> configure -> build -> check -> install -> package
+# Integra com /etc/package.conf e módulos: fetch.sh, patch.sh, hooks.sh, sandbox.sh, fakeroot.sh, logs.sh
+# Exporta: cmd_build build_port
 
 set -euo pipefail
 IFS=$'\n\t'
 
-### Configuráveis por ambiente ou /etc/package.conf
+# Carrega config global (se existir)
+PKG_CONF=${PKG_CONF:-/etc/package.conf}
+[ -f "$PKG_CONF" ] && source "$PKG_CONF"
+
+# Variáveis padrão (caso não venham do package.conf)
 PORTSDIR=${PORTSDIR:-/usr/ports}
-WORKDIR=${WORKDIR:-/var/cache/package/work}
-DISTDIR=${DISTDIR:-/var/cache/package/distfiles}
+MODULEDIR=${MODULEDIR:-/opt/package/modules}
+CACHE_DIR=${CACHE_DIR:-/var/cache/package}
+DISTDIR=${DISTDIR:-${CACHE_DIR}/distfiles}
+WORKDIR=${WORKDIR:-${CACHE_DIR}/work}
+LOG_DIR=${LOG_DIR:-/var/log/package}
+BUILD_LOG_DIR=${BUILD_LOG_DIR:-${LOG_DIR}/builds}
+PATCH_LOG_DIR=${PATCH_LOG_DIR:-${LOG_DIR}/patches}
+HOOK_LOG_DIR=${HOOK_LOG_DIR:-${LOG_DIR}/hooks}
+FILES_DIR=${FILES_DIR:-/var/lib/package/files}
 PREFIX=${PREFIX:-/usr/local}
 MAKEFLAGS=${MAKEFLAGS:-"-j$(nproc)"}
-CONFIGURE_ARGS=${CONFIGURE_ARGS:-""}
-LOG_DIR=${LOG_DIR:-/var/log/package}
-FILES_DIR=${FILES_DIR:-/var/lib/package/files}
-SANDBOX_METHOD=${SANDBOX_METHOD:-none}    # none|bubblewrap|chroot|container
-STRICT_CHECK=${STRICT_CHECK:-no}          # yes|no
+SANDBOX_METHOD=${SANDBOX_METHOD:-none}
+SANDBOX_BASE=${SANDBOX_BASE:-/var/tmp/package-sandbox}
+RETAIN_BUILD_DIR=${RETAIN_BUILD_DIR:-no}
+CLEAN_WORKDIR_AFTER_BUILD=${CLEAN_WORKDIR_AFTER_BUILD:-yes}
+APPLY_PATCHES=${APPLY_PATCHES:-yes}
 HOOKS_RUN_MAKEFILE=${HOOKS_RUN_MAKEFILE:-yes}
+FAKEROOT_TOOL=${FAKEROOT_TOOL:-tar}
+STRICT_CHECK=${STRICT_CHECK:-no}
+DRY_RUN=${DRY_RUN:-no}
 
-# Cria diretórios necessários
-mkdir -p "$WORKDIR" "$DISTDIR" "$FILES_DIR" "$LOG_DIR"
+mkdir -p "$WORKDIR" "$DISTDIR" "$LOG_DIR" "$BUILD_LOG_DIR" "$PATCH_LOG_DIR" "$HOOK_LOG_DIR" "$FILES_DIR"
 
-### Logging simples caso não haja módulo externo
+# Local modules (prefer MODULEDIR then relative modules dir)
+MODULE_DIR_CANDIDATES=("${MODULEDIR}" "$(dirname "$(realpath "${BASH_SOURCE[0]}")")/modules" "$(dirname "$(realpath "${BASH_SOURCE[0]}"))/..")
+for d in "${MODULE_DIR_CANDIDATES[@]}"; do
+  if [ -d "$d" ]; then
+    MODULE_DIR="$d"
+    break
+  fi
+done
+MODULE_DIR=${MODULE_DIR:-/opt/package/modules}
+
+# Fonte de módulos: tente carregar se existirem
+[ -f "$MODULE_DIR/fetch.sh" ] && source "$MODULE_DIR/fetch.sh"
+[ -f "$MODULE_DIR/patch.sh" ] && source "$MODULE_DIR/patch.sh"
+[ -f "$MODULE_DIR/hooks.sh" ] && source "$MODULE_DIR/hooks.sh"
+[ -f "$MODULE_DIR/sandbox.sh" ] && source "$MODULE_DIR/sandbox.sh"
+[ -f "$MODULE_DIR/fakeroot.sh" ] && source "$MODULE_DIR/fakeroot.sh"
+[ -f "$MODULE_DIR/logs.sh" ] && source "$MODULE_DIR/logs.sh"
+
+# logging minimal
 if ! declare -F log_info >/dev/null 2>&1; then
   log_info(){ echo "[build][INFO] $*"; }
 fi
@@ -37,50 +68,15 @@ if ! declare -F log_event >/dev/null 2>&1; then
   log_event(){ :; }
 fi
 
-### Carrega módulos auxiliares se existirem (fetch, patch, hooks, dependency, fakeroot, sandbox, logs)
-MODULE_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
-[ -f "$MODULE_DIR/fetch.sh" ]     && source "$MODULE_DIR/fetch.sh"
-[ -f "$MODULE_DIR/patch.sh" ]     && source "$MODULE_DIR/patch.sh"
-[ -f "$MODULE_DIR/hooks.sh" ]     && source "$MODULE_DIR/hooks.sh"
-[ -f "$MODULE_DIR/dependency.sh" ] && source "$MODULE_DIR/dependency.sh"
-[ -f "$MODULE_DIR/fakeroot.sh" ]  && source "$MODULE_DIR/fakeroot.sh"
-[ -f "$MODULE_DIR/sandbox.sh" ]   && source "$MODULE_DIR/sandbox.sh"
-[ -f "$MODULE_DIR/logs.sh" ]      && source "$MODULE_DIR/logs.sh"
+# Fallbacks para funções de módulo
+: ${cmd_fetch:=:}
+: ${apply_patches:=:}
+: ${run_hook:=:}
+: ${sandbox_exec:=:}
+: ${fakeroot_install_from_staging:=:}
 
-# Fallbacks para funções esperadas de módulos
-if ! declare -F cmd_fetch >/dev/null 2>&1; then
-  cmd_fetch(){ log_warn "cmd_fetch não implementado: pulando fetch para $1"; return 0; }
-fi
-if ! declare -F apply_patches >/dev/null 2>&1; then
-  apply_patches(){ log_warn "apply_patches não implementado: pulando patches para $1"; return 0; }
-fi
-if ! declare -F run_hook >/dev/null 2>&1; then
-  # run_hook PORTKEY HOOKNAME [ARGS...]
-  run_hook(){ log_info "(hook faltando) \$1:\$2"; return 0; }
-fi
-if ! declare -F resolve_dependencies >/dev/null 2>&1; then
-  resolve_dependencies(){ log_info "(resolver deps faltando) assumindo deps satisfeitas para $1"; return 0; }
-fi
-if ! declare -F fakeroot_install_from_staging >/dev/null 2>&1; then
-  fakeroot_install_from_staging(){
-    local staging="$1" portkey="$2"
-    log_warn "fakeroot_install_from_staging não implementado: usando rsync direto (pode requerer sudo)"
-    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-      sudo rsync -a "$staging"/ /
-    else
-      rsync -a "$staging"/ /
-    fi
-  }
-fi
-if ! declare -F sandbox_exec >/dev/null 2>&1; then
-  sandbox_exec(){ # simplesmente executa o comando diretamente
-    bash -c "$*"
-  }
-fi
-
-### Utilitários internos
-_makefile_var(){
-  # _makefile_var MAKEFILE VAR -> retorna valor (primeira palavra) ou vazio
+# util: lê variável do Makefile similar a _makefile_var mas preserva valores com espaços
+_read_makefile_var(){
   local mf="$1" var="$2"
   [ -f "$mf" ] || return 1
   awk -v v="$var" '
@@ -92,20 +88,17 @@ _makefile_var(){
         if (getline nx) val = val nx
         else break
       }
+      # strip comment
+      sub(/#.*$/,"",val)
       gsub(/^[[:space:]]+/,"",val)
       gsub(/[[:space:]]+$/,"",val)
       print val
       exit
     }
-  ' "$mf" | sed 's/#.*//' | xargs 2>/dev/null || true
+  ' "$mf"
 }
 
-_port_key_from_dir(){
-  local dir="$1"
-  local rel="${dir#$PORTSDIR/}"
-  echo "${rel//\//_}"
-}
-
+# detect build system
 _detect_build_system(){
   local src="$1"
   if [ -f "$src/configure" ]; then
@@ -119,259 +112,287 @@ _detect_build_system(){
   fi
 }
 
-_create_manifest_from_staging(){
-  local staging="$1" out_manifest="$2"
-  {
-    echo "{"
-    echo "  \"generated_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\"," 
-    echo "  \"staging\":\"$staging\"," 
-    echo "  \"files\":["
-    local first=1
-    (cd "$staging" && find . -type f -print0 | while IFS= read -r -d '' f; do
-      local final="/${f#./}"
-      if [ $first -eq 1 ]; then
-        printf "    \"%s\"\n" "$final"
-        first=0
-      else
-        printf "   , \"%s\"\n" "$final"
-      fi
-    done)
-    echo "  ]"
-    echo "}"
-  } > "$out_manifest"
-  log_info "Manifest gerado em $out_manifest"
-}
+# phases in order
+PHASES=(fetch verify extract patch configure build check install package)
 
-_run_in_sandbox_or_direct(){
-  local cmd_descr="$1"; shift
-  if [ "$SANDBOX_METHOD" != "none" ]; then
-    log_info "[$cmd_descr] executando em sandbox ($SANDBOX_METHOD): $*"
-    sandbox_exec "$*"
+_phase_index(){ local ph="$1"; for i in "${!PHASES[@]}"; do [ "${PHASES[$i]}" = "$ph" ] && echo $i && return 0; done; return 1; }
+
+# run command in sandbox if available, log to file
+_run_phase_cmd(){
+  local phase="$1" cmd="$2" workdir="$3" logfile="$4"
+  log_info "[phase:$phase] CMD: $cmd"
+  if [ "$DRY_RUN" = "yes" ]; then
+    log_info "DRY_RUN=yes -> não executando comando"
+    return 0
+  fi
+  mkdir -p "$(dirname "$logfile")"
+  if declare -F sandbox_exec >/dev/null 2>&1 && [ "$SANDBOX_METHOD" != "none" ]; then
+    # sandbox_exec expected to accept command as a single string
+    sandbox_exec "$cmd" >>"$logfile" 2>&1 || return $?
   else
-    log_info "[$cmd_descr] executando diretamente: $*"
-    bash -c "$*"
+    (cd "$workdir" && bash -lc "$cmd") >>"$logfile" 2>&1 || return $?
   fi
 }
 
-### Função principal: build de um port (diretório com Makefile)
+# high-level build_port implementation
 build_port(){
-  local port_dir="$1"
-  if [ -z "$port_dir" ]; then
-    log_error "build_port: port_dir ausente"
-    return 2
-  fi
-  if [ ! -f "$port_dir/Makefile" ]; then
-    log_error "Makefile não encontrado em $port_dir"
-    return 1
-  fi
+  local portdir="$1"
+  local resume_from="${2:-}"
+  if [ -z "$portdir" ]; then log_error "build_port: portdir faltando"; return 2; fi
+  if [ ! -d "$portdir" ] || [ ! -f "$portdir/Makefile" ]; then log_error "Port inválido ou Makefile ausente: $portdir"; return 1; fi
 
-  local mf portname portver portkey workdir srcdir builddir staging manifest files_list distfiles df bsystem
+  # read Makefile vars
+  local mf="$portdir/Makefile"
+  local SRC_URL PATCHES CONFIGURE_OPTS BUILD_OPTS INSTALL_OPTS PORTNAME PORTVERSION PORTKEY
+  SRC_URL=$(_read_makefile_var "$mf" "SRC_URL") || true
+  PATCHES=$(_read_makefile_var "$mf" "PATCHES") || true
+  CONFIGURE_OPTS=$(_read_makefile_var "$mf" "CONFIGURE_OPTS") || true
+  BUILD_OPTS=$(_read_makefile_var "$mf" "BUILD_OPTS") || true
+  INSTALL_OPTS=$(_read_makefile_var "$mf" "INSTALL_OPTS") || true
+  PORTNAME=$(_read_makefile_var "$mf" "PORTNAME") || true
+  PORTVERSION=$(_read_makefile_var "$mf" "PORTVERSION") || true
+  if [ -z "$PORTNAME" ]; then PORTNAME=$(basename "$portdir"); fi
+  if [ -z "$PORTVERSION" ]; then PORTVERSION="0.0.0"; fi
+  PORTKEY=${PORTKEY:-$(echo "${portdir#$PORTSDIR/}" | tr '/' '_')}
 
-  mf="$port_dir/Makefile"
-  portname=$(_makefile_var "$mf" "PORTNAME")
-  portver=$(_makefile_var "$mf" "PORTVERSION")
-  [ -z "$portname" ] && portname=$(basename "$port_dir")
-  [ -z "$portver" ] && portver=$(_makefile_var "$mf" "VERSION")
-  [ -z "$portver" ] && portver="0.0.0"
+  local workdir="$WORKDIR/${PORTKEY}-${PORTVERSION}"
+  local srcdir="$workdir/src"
+  local builddir="$workdir/build"
+  local staging="$workdir/staging"
+  local manifest="$workdir/${PORTKEY}-${PORTVERSION}.manifest.json"
+  mkdir -p "$workdir" "$srcdir" "$builddir" "$staging"
 
-  portkey=$(_port_key_from_dir "$port_dir")
-  workdir="$WORKDIR/${portkey}-${portver}"
-  srcdir="$workdir/src"
-  builddir="$workdir/build"
-  staging="$workdir/staging"
-  manifest="$workdir/${portkey}-${portver}.manifest.json"
-  files_list="${FILES_DIR}/${portkey}.list"
+  log_info "=== BUILD START: $PORTNAME ($PORTKEY) v$PORTVERSION ==="
+  log_event "build" "$PORTKEY" "$PORTVERSION" "start" || true
 
-  mkdir -p "$workdir" "$srcdir" "$builddir" "$staging" "$(dirname "$files_list")"
-
-  log_info "=== Iniciando build: $portname ($portkey) v$portver ==="
-  log_event "build" "$portkey" "$portver" "start" || true
-
-  # 0) Dependências
-  if declare -F resolve_dependencies >/dev/null 2>&1; then
-    log_info "Resolvendo dependências para $portkey"
-    if ! resolve_dependencies "$port_dir"; then
-      log_error "Falha ao resolver dependências para $portkey"
-      log_event "build" "$portkey" "$portver" "failed_deps" || true
-      return 1
-    fi
+  # determine resume index
+  local start_idx=0
+  if [ -n "$resume_from" ]; then
+    if idx=$(_phase_index "$resume_from"); then start_idx=$idx; fi
   fi
 
-  # 1) Fetch
-  if declare -F cmd_fetch >/dev/null 2>&1; then
-    log_info "Executando fetch para $portkey"
-    if ! cmd_fetch "$portkey"; then
-      log_error "cmd_fetch falhou para $portkey"
-      log_event "build" "$portkey" "$portver" "failed_fetch" || true
-      return 1
-    fi
+  # helper to run phase with hooks and logs
+  _run_phase(){
+    local phase="$1"; shift
+    if idx=$(_phase_index "$phase"); then true; else log_error "Fase desconhecida: $phase"; return 2; fi
+    if [ $idx -lt $start_idx ]; then log_info "Pulando fase $phase (antes do ponto de resume)"; return 0; fi
+
+    local phase_log="$BUILD_LOG_DIR/${PORTKEY}-${PORTVERSION}-${phase}.log"
+
+    # pre-hook
+    run_hook "$portdir" "pre-$phase" || log_warn "pre-$phase hook retornou não-zero"
+
+    # executar ação por fase
+    case "$phase" in
+      fetch)
+        if [ -z "$SRC_URL" ]; then
+          # tentar extrair DISTFILES da Makefile (compat com ports)
+          local df=$(grep -E "^DISTFILES" "$mf" | head -n1 | cut -d'=' -f2- | sed 's/#.*//') || true
+          if [ -n "$df" ]; then
+            df=$(echo "$df" | awk '{print $1}' | xargs)
+            if [ -f "$DISTDIR/$df" ]; then
+              log_info "Usando distfile local: $DISTDIR/$df"
+              cp -a "$DISTDIR/$df" "$workdir/" || true
+            else
+              log_info "Nenhum SRC_URL nem DISTFILES válido encontrado, copiando porta para srcdir"
+              cp -a "$portdir/." "$srcdir/"
+            fi
+          else
+            cp -a "$portdir/." "$srcdir/"
+          fi
+        else
+          if declare -F fetch_source >/dev/null 2>&1; then
+            fetch_source "$SRC_URL" "$srcdir" || return 1
+          else
+            log_error "fetch_source não disponível; não é possível obter fontes"; return 1
+          fi
+        fi
+        ;;
+      verify)
+        # verify: checar distinfo SHA256 se disponível
+        if [ -f "$portdir/distinfo" ]; then
+          log_info "Verificando checksums em distinfo"
+          # distinfo formato simples: SHA256 filename
+          if ! (cd "$srcdir" && awk '{print $1"  "substr($0,index($0,$2))}' "$portdir/distinfo" | sha256sum -c - >/dev/null 2>&1); then
+            log_error "Verificação de checksums falhou"; return 1
+          fi
+        else
+          log_info "Sem distinfo; pulando verificação";
+        fi
+        ;;
+      extract)
+        # se já foi baixado e extraído pelo fetch_source, pule; caso contrário tente extrair distfile do workdir
+        if [ -n "$(ls -A "$srcdir" 2>/dev/null || true)" ]; then
+          log_info "srcdir já tem arquivos; pulando extract"
+        else
+          # procurar arquivo em workdir
+          local df=$(ls -1 "$workdir"/* 2>/dev/null | head -n1 || true)
+          if [ -n "$df" ]; then
+            case "$df" in
+              *.tar.gz|*.tgz) tar -xzf "$df" -C "$srcdir" --strip-components=1 ;; 
+              *.tar.bz2|*.tbz2) tar -xjf "$df" -C "$srcdir" --strip-components=1 ;; 
+              *.tar.xz|*.txz) tar -xJf "$df" -C "$srcdir" --strip-components=1 ;; 
+              *.zip) unzip -q "$df" -d "$srcdir" ;;
+              *) cp -a "$df" "$srcdir/" ;;
+            esac
+          else
+            log_warn "Nenhum distfile para extrair e srcdir vazio"
+          fi
+        fi
+        ;;
+      patch)
+        if [ "$APPLY_PATCHES" != "yes" ]; then log_info "APPLY_PATCHES != yes -> pulando patches"; return 0; fi
+        if [ -n "$PATCHES" ]; then
+          if declare -F apply_patches >/dev/null 2>&1; then
+            apply_patches "$portdir" "$srcdir" >>"$PATCH_LOG_DIR/${PORTKEY}-${PORTVERSION}-patches.log" 2>&1 || { log_error "apply_patches falhou"; return 1; }
+          else
+            log_warn "apply_patches não implementado; pulando"
+          fi
+        else
+          # procurar patches em portdir/patches
+          if [ -d "$portdir/patches" ]; then
+            if declare -F apply_patches >/dev/null 2>&1; then
+              apply_patches "$portdir" "$srcdir" >>"$PATCH_LOG_DIR/${PORTKEY}-${PORTVERSION}-patches.log" 2>&1 || { log_error "apply_patches falhou"; return 1; }
+            else
+              log_warn "apply_patches não implementado; pulando"
+            fi
+          else
+            log_info "Nenhum patch encontrado; pulando"
+          fi
+        fi
+        ;;
+      configure)
+        run_hook "$portdir" "pre-configure" || true
+        local bsys=$(_detect_build_system "$srcdir")
+        log_info "Sistema de build: $bsys"
+        case "$bsys" in
+          autotools)
+            _run_phase_cmd "configure" "(cd $builddir && $srcdir/configure --prefix=$PREFIX $CONFIGURE_OPTS)" "$workdir" "$phase_log" || { log_error "configure falhou"; return 1; }
+            ;;
+          cmake)
+            _run_phase_cmd "configure" "(cd $builddir && cmake -DCMAKE_INSTALL_PREFIX=$PREFIX $CONFIGURE_OPTS $srcdir)" "$workdir" "$phase_log" || { log_error "cmake falhou"; return 1; }
+            ;;
+          meson)
+            _run_phase_cmd "configure" "meson setup $builddir --prefix=$PREFIX $CONFIGURE_OPTS $srcdir" "$workdir" "$phase_log" || { log_error "meson setup falhou"; return 1; }
+            ;;
+          *)
+            log_info "Sem etapa configure para make puro"
+            ;;
+        esac
+        run_hook "$portdir" "post-configure" || true
+        ;;
+      build)
+        run_hook "$portdir" "pre-build" || true
+        local bsys2=$(_detect_build_system "$srcdir")
+        case "$bsys2" in
+          meson)
+            _run_phase_cmd "build" "(cd $builddir && ninja $MAKEFLAGS $BUILD_OPTS)" "$workdir" "$phase_log" || { log_error "build falhou"; return 1; }
+            ;;
+          cmake)
+            _run_phase_cmd "build" "(cd $builddir && cmake --build . -- -j$(nproc) $BUILD_OPTS)" "$workdir" "$phase_log" || { log_error "build falhou"; return 1; }
+            ;;
+          *)
+            _run_phase_cmd "build" "(cd $builddir && make $MAKEFLAGS $BUILD_OPTS)" "$workdir" "$phase_log" || { log_error "make falhou"; return 1; }
+            ;;
+        esac
+        run_hook "$portdir" "post-build" || true
+        ;;
+      check)
+        if (cd "$builddir" && eval "$MAKE_CHECK_CMD" >/dev/null 2>&1); then
+          run_hook "$portdir" "pre-check" || true
+          _run_phase_cmd "check" "(cd $builddir && $MAKE_CHECK_CMD)" "$workdir" "$phase_log" || {
+            log_warn "Testes falharam; verifique $phase_log"
+            if [ "$STRICT_CHECK" = "yes" ]; then return 1; fi
+          }
+          run_hook "$portdir" "post-check" || true
+        else
+          log_info "Target de check não detectado; pulando"
+        fi
+        ;;
+      install)
+        run_hook "$portdir" "pre-install" || true
+        mkdir -p "$staging"
+        export DESTDIR="$staging"
+        local bsys3=$(_detect_build_system "$srcdir")
+        case "$bsys3" in
+          meson)
+            _run_phase_cmd "install" "(cd $builddir && ninja install DESTDIR=$DESTDIR)" "$workdir" "$phase_log" || { log_error "install falhou"; return 1; }
+            ;;
+          cmake)
+            _run_phase_cmd "install" "(cd $builddir && cmake --install . --prefix=$PREFIX --destdir=$DESTDIR)" "$workdir" "$phase_log" || { log_error "install falhou"; return 1; }
+            ;;
+          *)
+            _run_phase_cmd "install" "(cd $builddir && make DESTDIR=$DESTDIR install $INSTALL_OPTS)" "$workdir" "$phase_log" || { log_error "install falhou"; return 1; }
+            ;;
+        esac
+        unset DESTDIR
+        run_hook "$portdir" "post-install" || true
+        ;;
+      package)
+        run_hook "$portdir" "pre-package" || true
+        # gerar lista de arquivos
+        : > "$FILES_DIR/${PORTKEY}.list"
+        (cd "$staging" && find . -type f -print0 | while IFS= read -r -d '' f; do printf "/%s\n" "${f#./}"; done) >> "$FILES_DIR/${PORTKEY}.list"
+        # gerar manifest
+        (cd "$staging" && tar -czpf "$workdir/${PORTKEY}-${PORTVERSION}.tar.gz" .) || { log_error "Falha ao gerar tar.gz"; return 1; }
+        if declare -F fakeroot_install_from_staging >/dev/null 2>&1; then
+          fakeroot_install_from_staging "$staging" "$PORTKEY" >>"$BUILD_LOG_DIR/${PORTKEY}-${PORTVERSION}-package.log" 2>&1 || { log_error "fakeroot_install falhou"; return 1; }
+        fi
+        _create_manifest_from_staging "$staging" "$manifest" || true
+        run_hook "$portdir" "post-package" || true
+        ;;
+      *)
+        log_warn "Fase não implementada: $phase"; return 2
+        ;;
+    esac
+
+    log_info "[phase:$phase] concluída. log: $phase_log"
+    run_hook "$portdir" "after-$phase" || true
+    return 0
+  }
+
+  # iterate phases
+  local i
+  for i in "${PHASES[@]}"; do
+    _run_phase "$i" || { log_error "Fase $i falhou. Ver logs em $BUILD_LOG_DIR"; log_event "build" "$PORTKEY" "$PORTVERSION" "failed_$i" || true; return 1; }
+  done
+
+  log_info "=== BUILD SUCCESS: $PORTNAME ($PORTKEY) v$PORTVERSION ==="
+  log_event "build" "$PORTKEY" "$PORTVERSION" "success" || true
+
+  # cleanup
+  if [ "$CLEAN_WORKDIR_AFTER_BUILD" = "yes" ] && [ "$RETAIN_BUILD_DIR" != "yes" ]; then
+    rm -rf "$workdir" || true
   fi
 
-  # 2) Preparar fontes
-  log_info "Preparando fontes em $srcdir"
-  distfiles=$(_makefile_var "$mf" "DISTFILES")
-  if [ -n "$distfiles" ]; then
-    df=$(echo "$distfiles" | awk '{print $1}')
-    if [ -f "$DISTDIR/$df" ]; then
-      log_info "Extraindo $DISTDIR/$df para $srcdir"
-      (cd "$srcdir" && tar xf "$DISTDIR/$df") || { log_error "Falha ao extrair $df"; return 1; }
-    else
-      log_warn "Distfile $df não encontrado em $DISTDIR; copiando porta para srcdir"
-      cp -a "$port_dir/." "$srcdir/"
-    fi
+  # return path to generated package or staging
+  if [ -f "$workdir/${PORTKEY}-${PORTVERSION}.tar.gz" ]; then
+    echo "$workdir/${PORTKEY}-${PORTVERSION}.tar.gz"
   else
-    cp -a "$port_dir/." "$srcdir/"
+    echo "$staging"
   fi
-
-  # 3) Aplicar patches
-  if declare -F apply_patches >/dev/null 2>&1; then
-    log_info "Aplicando patches para $portkey"
-    if ! apply_patches "$portkey" "$srcdir"; then
-      log_error "Falha ao aplicar patches em $portkey"
-      log_event "build" "$portkey" "$portver" "failed_patches" || true
-      return 1
-    fi
-  fi
-
-  # 4) Detectar sistema de build
-  bsystem=$(_detect_build_system "$srcdir")
-  log_info "Sistema de build detectado: $bsystem"
-
-  # 5) Limpar builddir
-  rm -rf "$builddir"
-  mkdir -p "$builddir"
-
-  # Hook: pre-configure
-  run_hook "$portkey" "pre-configure" || log_warn "pre-configure hook retornou não-zero"
-
-  # 6) Configurar
-  local log_cf="$LOG_DIR/${portkey}-${portver}-configure.log"
-  case "$bsystem" in
-    autotools)
-      log_info "Executando autotools configure"
-      (cd "$builddir" && _run_in_sandbox_or_direct "configure" "$srcdir/configure --prefix=$PREFIX $CONFIGURE_ARGS") >"$log_cf" 2>&1 || {
-        log_error "Falha na configure. Veja $log_cf"; log_event "build" "$portkey" "$portver" "failed_configure" || true; return 1
-      }
-      ;;
-    cmake)
-      log_info "Executando cmake"
-      (cd "$builddir" && _run_in_sandbox_or_direct "configure" "cmake -DCMAKE_INSTALL_PREFIX=$PREFIX $CONFIGURE_ARGS $srcdir") >"$log_cf" 2>&1 || {
-        log_error "Falha no cmake. Veja $log_cf"; log_event "build" "$portkey" "$portver" "failed_configure" || true; return 1
-      }
-      ;;
-    meson)
-      log_info "Executando meson setup"
-      _run_in_sandbox_or_direct "configure" "meson setup $builddir --prefix=$PREFIX $CONFIGURE_ARGS $srcdir" >"$log_cf" 2>&1 || {
-        log_error "Falha no meson setup. Veja $log_cf"; log_event "build" "$portkey" "$portver" "failed_configure" || true; return 1
-      }
-      ;;
-    *)
-      log_info "Sem etapa configure para sistema plain make"
-      ;;
-  esac
-  run_hook "$portkey" "post-configure" || log_warn "post-configure hook não-zero"
-
-  # 7) Build
-  run_hook "$portkey" "pre-build" || log_warn "pre-build hook não-zero"
-  local log_bu="$LOG_DIR/${portkey}-${portver}-build.log"
-  case "$bsystem" in
-    meson)
-      log_info "Construindo com ninja"
-      (cd "$builddir" && _run_in_sandbox_or_direct "build" "ninja $MAKEFLAGS") >"$log_bu" 2>&1 || { log_error "Falha no build. Veja $log_bu"; log_event "build" "$portkey" "$portver" "failed_build" || true; return 1; }
-      ;;
-    *)
-      log_info "Construindo com make"
-      (cd "$builddir" && _run_in_sandbox_or_direct "build" "make $MAKEFLAGS") >"$log_bu" 2>&1 || { log_error "Falha no build. Veja $log_bu"; log_event "build" "$portkey" "$portver" "failed_build" || true; return 1; }
-      ;;
-  esac
-  run_hook "$portkey" "post-build" || log_warn "post-build hook não-zero"
-
-  # 8) Check/testes
-  local test_log="$LOG_DIR/${portkey}-${portver}-check.log"
-  if (cd "$builddir" && make -n check >/dev/null 2>&1); then
-    run_hook "$portkey" "pre-check" || true
-    log_info "Executando make check para $portkey"
-    (cd "$builddir" && _run_in_sandbox_or_direct "check" "make check") >"$test_log" 2>&1 || {
-      log_warn "make check falhou para $portkey; verifique $test_log"
-      if [ "$STRICT_CHECK" = "yes" ]; then
-        log_event "build" "$portkey" "$portver" "failed_check" || true
-        return 1
-      fi
-    }
-    run_hook "$portkey" "post-check" || true
-  else
-    log_info "Não há target 'check' presente ou não executável; pulando testes"
-  fi
-
-  # 9) Instalar em staging (DESTDIR)
-  log_info "Instalando em staging: $staging"
-  mkdir -p "$staging"
-  export DESTDIR="$staging"
-  local log_inst="$LOG_DIR/${portkey}-${portver}-install.log"
-  case "$bsystem" in
-    meson)
-      (cd "$builddir" && _run_in_sandbox_or_direct "install" "ninja install DESTDIR=$DESTDIR") >"$log_inst" 2>&1 || { log_error "Falha na instalação (staging). Veja $log_inst"; log_event "build" "$portkey" "$portver" "failed_install" || true; return 1; }
-      ;;
-    cmake)
-      (cd "$builddir" && _run_in_sandbox_or_direct "install" "cmake --install . --prefix=$PREFIX --destdir=$DESTDIR") >"$log_inst" 2>&1 || { log_error "Falha na instalação (staging). Veja $log_inst"; log_event "build" "$portkey" "$portver" "failed_install" || true; return 1; }
-      ;;
-    *)
-      (cd "$builddir" && _run_in_sandbox_or_direct "install" "make install DESTDIR=$DESTDIR") >"$log_inst" 2>&1 || { log_error "Falha na instalação (staging). Veja $log_inst"; log_event "build" "$portkey" "$portver" "failed_install" || true; return 1; }
-      ;;
-  esac
-  unset DESTDIR
-
-  # 10) Gerar lista de arquivos e manifest
-  log_info "Gerando lista de arquivos instalados em $files_list"
-  : > "$files_list"
-  (cd "$staging" && find . -type f -print0 | while IFS= read -r -d '' f; do
-    printf "/%s\n" "${f#./}"
-  done) >> "$files_list"
-
-  _create_manifest_from_staging "$staging" "$manifest"
-
-  # 11) Hook post-install (em staging)
-  run_hook "$portkey" "post-install" || log_warn "post-install hook não-zero"
-
-  log_info "Build concluído com sucesso para $portkey ($portname v$portver). Staging: $staging"
-  log_event "build" "$portkey" "$portver" "success" || true
-
-  # Retorna caminho do staging
-  echo "$staging"
-  return 0
 }
 
-### Wrapper cmd_build
+# CLI wrapper: cmd_build <portkey|/path/to/port> [--resume <phase>]
 cmd_build(){
-  local port="$1"
-  if [ -z "$port" ]; then
-    log_error "Uso: cmd_build <categoria/nome> ou caminho para portdir"
-    return 2
-  fi
-  local port_dir
-  if [ -d "$port" ] && [ -f "$port/Makefile" ]; then
-    port_dir="$port"
-  else
-    port_dir="$PORTSDIR/$port"
-  fi
-  if [ ! -d "$port_dir" ]; then
-    log_error "Port não encontrado: $port_dir"
-    return 1
-  fi
-  build_port "$port_dir"
+  if [ $# -lt 1 ]; then echo "Uso: cmd_build <categoria/port|/caminho/portdir> [--resume <phase>]"; return 2; fi
+  local arg="$1"; shift
+  local resume=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --resume) resume="$2"; shift 2 ;;
+      --dry-run) DRY_RUN=yes; shift ;;
+      *) shift ;;
+    esac
+  done
+  local portdir
+  if [ -d "$arg" ] && [ -f "$arg/Makefile" ]; then portdir="$arg"; else portdir="$PORTSDIR/$arg"; fi
+  build_port "$portdir" "$resume"
 }
 
-export -f cmd_build build_port
+export -f build_port cmd_build
 
-### Execução direta
+# se executado diretamente
 if [ "${BASH_SOURCE[0]}" = "$0" ]; then
-  if [ $# -lt 1 ]; then
-    echo "Uso: $0 <categoria/nome>  ou $0 /caminho/para/portdir"
-    exit 1
-  fi
-  if [ -d "$1" ] && [ -f "$1/Makefile" ]; then
-    build_port "$1"
-  else
-    cmd_build "$1"
-  fi
+  cmd_build "$@"
 fi
