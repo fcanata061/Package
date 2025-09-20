@@ -1,219 +1,141 @@
 #!/usr/bin/env bash
-# /opt/package/bin/package
-# CLI principal atualizado com suporte a módulos, abreviaturas, e coloração
+# bin/package - CLI principal atualizado
+# - Carrega módulos em MODULEDIR
+# - Suporta aliases/abreviações
+# - Coloração condicional
+# - Expondo register list/info (via register.sh)
 
 set -euo pipefail
 IFS=$'\n\t'
 
-# ---- Configuração padrão ----
-CONFIG_FILE=/etc/package.conf
-if [ -f "$CONFIG_FILE" ]; then
-  # shellcheck disable=SC1090
-  source "$CONFIG_FILE"
-fi
+# Load global config if present
+[ -f /etc/package.conf ] && source /etc/package.conf
 
 MODULEDIR=${MODULEDIR:-/opt/package/modules}
 PORTSDIR=${PORTSDIR:-/usr/ports}
 PREFIX=${PREFIX:-/usr/local}
 
-# ---- Coloração ANSI ----
-# Verifica se saída é TTY
-if [ -t 1 ]; then
+# Colors
+if [ "${COLOR_OUTPUT:-yes}" = "yes" ] && [ -t 1 ]; then
   COLOR_RESET="\033[0m"
-  COLOR_RED="\033[31m"
-  COLOR_GREEN="\033[32m"
-  COLOR_YELLOW="\033[33m"
+  COLOR_RED="${COLOR_ERROR:-\033[31m}"
+  COLOR_GREEN="${COLOR_INFO:-\033[32m}"
+  COLOR_YELLOW="${COLOR_WARN:-\033[33m}"
   COLOR_CYAN="\033[36m"
 else
-  COLOR_RESET=""
-  COLOR_RED=""
-  COLOR_GREEN=""
-  COLOR_YELLOW=""
-  COLOR_CYAN=""
+  COLOR_RESET=""; COLOR_RED=""; COLOR_GREEN=""; COLOR_YELLOW=""; COLOR_CYAN=""
 fi
 
-log() {
-  echo -e "${COLOR_CYAN}[package]${COLOR_RESET} $*"
-}
+log()  { printf '%b\n' "${COLOR_CYAN}[package]${COLOR_RESET} $*"; }
+info() { printf '%b\n' "${COLOR_GREEN}[INFO]${COLOR_RESET} $*"; }
+warn() { printf '%b\n' "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"; }
+err()  { printf '%b\n' "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2; }
 
-info() {
-  echo -e "${COLOR_GREEN}[INFO]${COLOR_RESET} $*"
-}
-
-warn() {
-  echo -e "${COLOR_YELLOW}[WARN]${COLOR_RESET} $*"
-}
-
-err() {
-  echo -e "${COLOR_RED}[ERROR]${COLOR_RESET} $*" >&2
-}
-
-# ---- Carrega todos os módulos ----
+# Load modules: source all *.sh under MODULEDIR if enabled
 load_modules() {
-  if [ -d "$MODULEDIR" ]; then
-    for m in "$MODULEDIR"/*.sh; do
-      if [ -r "$m" ]; then
-        # shellcheck disable=SC1090
-        source "$m"
-      fi
-    done
-  fi
+  [ -d "$MODULEDIR" ] || return 0
+  for m in "$MODULEDIR"/*.sh; do
+    [ -r "$m" ] || continue
+    # don't error out if file missing
+    # shellcheck disable=SC1090
+    source "$m"
+  done
 }
 
-# ---- Uso / help ----
-usage() {
-  cat <<EOF
-${COLOR_CYAN}Uso:${COLOR_RESET} package [comando] [porta] [opções]
+# Aliases mapping (can be overridden by /etc/package.conf ALIASES)
+ALIASES=${ALIASES:-${ALIAS_MAP:-"f:fetch b:build i:install r:remove u:upgrade d:deps upd:update full:full reg:register"}}
 
-Comandos disponíveis:
-  fetch, f           - baixa fontes do port
-  build, b           - compila o port
-  install, i         - instala o port
-  remove, rm, r      - remove o port
-  upgrade, up, u     - atualiza o port
-  deps, d            - mostra/resolva dependências
-  update, upd        - verifica versões novas de todos os ports
-  list, ls           - lista ports instalados ou disponíveis
-  service, srv       - gerencia systemd (start/stop/enable/disable/etc.)
-  help, h            - mostra esta ajuda
-
-Exemplos:
-  package build editors/vim
-  package up gcc
-  package deps net/httpd
-  package upd           # verifica updates
-EOF
-}
-
-# ---- Mapeamento de abreviaturas ----
 resolve_cmd() {
   local cmd="$1"
+  # expand aliases
+  for a in $ALIASES; do
+    IFS=':' read -r key val <<< "$a"
+    if [ "$cmd" = "$key" ]; then
+      echo "$val"
+      return 0
+    fi
+  done
   case "$cmd" in
-    f|fetch)          echo "fetch" ;;
-    b|build)          echo "build" ;;
-    i|install)        echo "install" ;;
-    r|rm|remove)      echo "remove" ;;
-    u|up|upgrade)     echo "upgrade" ;;
-    d|deps)           echo "deps" ;;
-    upd|update)       echo "update" ;;
-    ls|list)          echo "list" ;;
-    srv|service)      echo "service" ;;
-    h|help|--help)    echo "help" ;;
-    full|all)        echo "full" ;;
-    *)                echo "$cmd" ;;
+    h|help|--help) echo "help"; return 0 ;;
+    *) echo "$cmd"; return 0 ;;
   esac
 }
 
-# ---- Execução principal ----
+usage() {
+  cat <<EOF
+${COLOR_CYAN}Uso:${COLOR_RESET} package <comando> [args]
+
+Comandos comuns:
+  fetch (f)        build (b)       install (i)     remove (r)
+  upgrade (u)      update (upd)    deps (d)        full
+  list, ls         service (srv)   sync
+  register (reg) list|info <port>  # register list/info
+  help (h)
+
+Ex.: package full lang/gcc
+     package reg list
+     package register info lang/gcc
+EOF
+}
+
 main() {
   if [ $# -lt 1 ]; then
     usage
     exit 1
   fi
 
-  local cmd_orig="$1"; shift
-  local cmd=$(resolve_cmd "$cmd_orig")
+  local cmd_in="$1"; shift
+  local cmd; cmd=$(resolve_cmd "$cmd_in")
 
+  # Load modules after resolving config
   load_modules
 
+  # register subcommands
+  if [ "$cmd" = "register" ]; then
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+      list)
+        if declare -F cmd_register_list >/dev/null; then
+          cmd_register_list "$@"
+          exit $?
+        else
+          err "register.list não disponível (module register não carregado)"
+          exit 2
+        fi
+        ;;
+      info)
+        if declare -F cmd_register_info >/dev/null; then
+          cmd_register_info "$@"
+          exit $?
+        else
+          err "register.info não disponível (module register não carregado)"
+          exit 2
+        fi
+        ;;
+      *)
+        err "Subcomando register desconhecido: $sub"
+        usage; exit 2
+        ;;
+    esac
+  fi
+
+  # Dispatch to module exposed functions (cmd_<name>)
   case "$cmd" in
-    fetch)
-      if declare -F cmd_fetch >/dev/null; then
-        cmd_fetch "$@"
+    help) usage; exit 0 ;;
+    fetch|build|install|remove|upgrade|update|deps|full|list|service|sync)
+      local fn="cmd_${cmd}"
+      if declare -F "$fn" >/dev/null; then
+        "$fn" "$@"; exit $?
       else
-        err "Comando fetch não implementado."
+        err "Comando '$cmd' não implementado (módulo ausente?)"
         exit 2
       fi
-      ;;
-    build)
-      if declare -F cmd_build >/null 2>&1; then
-        cmd_build "$@"
-      else
-        err "Comando build não implementado."
-        exit 2
-      fi
-      ;;
-    install)
-      if declare -F cmd_install >/dev/null 2>&1; then
-        cmd_install "$@"
-      else
-        err "Comando install não implementado."
-        exit 2
-      fi
-      ;;
-    remove)
-      if declare -F cmd_remove >/dev/null 2>&1; then
-        cmd_remove "$@"
-      else
-        err "Comando remove não implementado."
-        exit 2
-      fi
-      ;;
-    upgrade)
-      if declare -F cmd_upgrade >/dev/null 2>&1; then
-        cmd_upgrade "$@"
-      else
-        err "Comando upgrade não implementado."
-        exit 2
-      fi
-      ;;
-    deps)
-      if declare -F cmd_deps >/dev/null 2>&1; then
-        cmd_deps "$@"
-      else
-        err "Comando deps não implementado."
-        exit 2
-      fi
-      ;;
-    update)
-      if declare -F cmd_update >/dev/null 2>&1; then
-        cmd_update "$@"
-      else
-        err "Comando update não implementado."
-        exit 2
-      fi
-      ;;
-    list)
-      if declare -F cmd_list >/dev/null 2>&1; then
-        cmd_list "$@"
-      else
-        err "Comando list não implementado."
-        exit 2
-      fi
-      ;;
-    service)
-      if declare -F cmd_service >/dev/null 2>&1; then
-        cmd_service "$@"
-      else
-        err "Comando service não implementado."
-        exit 2
-      fi
-      ;;
-    help)
-      usage
-      ;;
-    full)
-      # pipeline completo
-      local port="$1"
-      [ -z "$port" ] && { err "Uso: package full <categoria/port>"; exit 2; }
-
-      info "Executando processo completo para $port"
-
-      if declare -F cmd_fetch >/dev/null; then cmd_fetch "$port"; fi
-      if declare -F cmd_deps >/dev/null; then cmd_deps "$port"; fi
-      if declare -F cmd_patch >/dev/null; then cmd_patch "$port"; fi
-      if declare -F cmd_build >/dev/null; then cmd_build "$port"; fi
-      if declare -F cmd_install >/dev/null; then cmd_install "$port"; fi
-
-      info "Port $port instalado com sucesso via full"
       ;;
     *)
-      err "Comando desconhecido: $cmd_orig"
-      usage
-      exit 2
+      err "Comando desconhecido: $cmd_in"
+      usage; exit 2
       ;;
   esac
 }
 
-# ---- Inicia CLI ----
 main "$@"
