@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# /opt/package/bin/package
+# CLI principal - esqueleto
+set -euo pipefail
+IFS=$'\n\t'
+
+# Carrega configuração
+CONFIG_FILE=/etc/package.conf
+if [ -f "$CONFIG_FILE" ]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+
+MODULEDIR=${MODULEDIR:-/opt/package/modules}
+PORTSDIR=${PORTSDIR:-/usr/ports}
+PREFIX=${PREFIX:-/usr/local}
+
+log() { echo "[package] $*"; }
+err() { echo "[package] ERROR: $*" >&2; }
+
+# carrega todos os módulos (.sh) do diretório MODULEDIR
+load_modules() {
+  if [ -d "$MODULEDIR" ]; then
+    for m in "$MODULEDIR"/*.sh; do
+      # shellcheck disable=SC1090
+      [ -r "$m" ] && source "$m"
+    done
+  fi
+}
+
+usage() {
+  cat <<EOF
+Uso: package <comando> [opções]
+Comandos:
+  fetch <categoria/port>   - baixa fontes do port
+  build  <categoria/port>  - compila o port
+  install <categoria/port> - instala no PREFIX
+  service <nome> <action>  - gerencia systemd para um package instalado (ex: start/stop/restart/enable)
+  list <categoria>         - lista ports
+  help                     - mostra essa ajuda
+EOF
+}
+
+main() {
+  if [ $# -lt 1 ]; then
+    usage; exit 1
+  fi
+  cmd=$1; shift
+  load_modules
+  case "$cmd" in
+    fetch)  cmd_fetch "$@" ;;    # definido em modules/fetch.sh
+    build)  cmd_build "$@" ;;    # definido em modules/build.sh
+    install) cmd_install "$@" ;;  # definido em modules/install.sh
+    service) cmd_service "$@" ;;  # definido em modules/service.sh
+    list) cmd_list "$@" ;;
+    help|--help|-h) usage ;;
+    *) err "Comando desconhecido: $cmd"; usage; exit 2 ;;
+  esac
+}
+
+main "$@"
