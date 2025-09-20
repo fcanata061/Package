@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# modules/build.sh
+# Responsável por preparar / compilar o port
+
+cmd_build() {
+  local port_path="$1"
+  [ -n "$port_path" ] || { err "build requer port (ex: net/httpd)"; return 2; }
+  local portdir="$PORTSDIR/$port_path"
+  [ -d "$portdir" ] || { err "Port não encontrado: $portdir"; return 3; }
+
+  log "Iniciando build do port: $port_path"
+  mkdir -p /var/tmp/package-build
+  pushd /var/tmp/package-build >/dev/null
+  # Exemplo genérico: extrair tarball do cache e rodar um Makefile do port
+  # Este é um esqueleto — adapte às regras dos seus ports
+  if [ -f "$CACHE_DIR/$(basename "$portdir")" ]; then
+    tar xf "$CACHE_DIR/$(basename "$portdir")"
+  fi
+  if [ -f "$portdir/Makefile" ]; then
+    make -C "$portdir" PREFIX="$PREFIX" ${MAKEFLAGS:-}
+  else
+    err "Makefile não encontrado no port"
+    popd >/dev/null
+    return 4
+  fi
+  popd >/dev/null
+}
