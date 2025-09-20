@@ -2,13 +2,16 @@
 # modules/install.sh
 #
 # Instala um port previamente construído (via build.sh) no sistema.
+# Inclui rollback em caso de falha, manifest JSON e integração com logs.
+#
 # Fluxo:
 #   1. Localiza staging (WORKDIR/<port>/staging)
 #   2. Executa hooks pre-install-system
-#   3. Copia arquivos com fakeroot
-#   4. Executa hooks post-install-system
-#   5. Registra no banco de pacotes
-#   6. Ativa serviços, se houver
+#   3. Copia arquivos com fakeroot (rsync)
+#   4. Gera manifest JSON
+#   5. Executa hooks post-install-system
+#   6. Registra no banco
+#   7. Ativa serviços, se houver
 
 set -euo pipefail
 
@@ -17,9 +20,11 @@ set -euo pipefail
 PORTSDIR=${PORTSDIR:-/usr/ports}
 WORKDIR=${WORKDIR:-/usr/ports/work}
 DBDIR=${DBDIR:-/var/lib/package/db}
+LOGDIR=${LOGDIR:-/var/log/package}
 PREFIX=${PREFIX:-/usr/local}
+TRASHDIR=${TRASHDIR:-/var/lib/package/trash}
 
-mkdir -p "$WORKDIR" "$DBDIR"
+mkdir -p "$WORKDIR" "$DBDIR" "$LOGDIR" "$TRASHDIR"
 
 # --- Logging ---
 : "${log_info:=:}"
@@ -42,8 +47,33 @@ source "$MODULESDIR/hooks.sh"
 source "$MODULESDIR/fakeroot.sh"
 source "$MODULESDIR/register.sh"
 source "$MODULESDIR/service.sh"
+source "$MODULESDIR/logs.sh"
+
+# --- Funções auxiliares ---
+
+_manifest_file() {
+  local name="$1" version="$2"
+  echo "$DBDIR/$name-$version.manifest.json"
+}
+
+_generate_manifest() {
+  local staging="$1" name="$2" version="$3"
+  local manifest="$(_manifest_file "$name" "$version")"
+
+  log_info "Gerando manifest $manifest"
+  {
+    echo "{"
+    echo "  \"name\": \"$name\","
+    echo "  \"version\": \"$version\","
+    echo "  \"files\": ["
+    find "$staging" -type f | sed 's#^'"$staging"'#/usr/local#' | sed 's/$/,/' | sed '$ s/,$//'
+    echo "  ]"
+    echo "}"
+  } > "$manifest"
+}
 
 # --- Função principal ---
+
 install_port() {
   local port_dir="$1"
 
@@ -52,10 +82,11 @@ install_port() {
     return 1
   }
 
-  local name version staging
+  local name version staging manifest
   name=$(make -C "$port_dir" -s -f Makefile -V PORTNAME || basename "$port_dir")
   version=$(make -C "$port_dir" -s -f Makefile -V PORTVERSION || echo "0")
   staging="$WORKDIR/$name-$version/staging"
+  manifest="$(_manifest_file "$name" "$version")"
 
   [ -d "$staging" ] || {
     log_error "Staging não encontrado para $name-$version. Execute build.sh antes."
@@ -63,13 +94,30 @@ install_port() {
   }
 
   log_info "=== Instalando $name-$version no sistema ==="
+  log_event "install" "$name" "$version" "start"
 
   # Hooks pre-install-system
   run_hook pre-install-system "$port_dir"
 
-  # Copiar arquivos com fakeroot
-  log_info "Copiando arquivos de $staging para $PREFIX"
-  fakeroot_exec rsync -a "$staging/" "$PREFIX/"
+  # Rollback: mover arquivos já existentes para TRASHDIR
+  local rollback_dir="$TRASHDIR/${name}-${version}-$(date +%s)"
+  mkdir -p "$rollback_dir"
+  log_info "Preparando rollback em $rollback_dir"
+
+  rsync -a --ignore-existing "$staging/" "$PREFIX/" || true
+  rsync -a --existing "$PREFIX/" "$rollback_dir/" || true
+
+  # Copiar staging para sistema (com fakeroot)
+  log_info "Copiando arquivos para $PREFIX"
+  if ! fakeroot_exec rsync -a "$staging/" "$PREFIX/"; then
+    log_error "Falha na cópia, iniciando rollback"
+    rsync -a "$rollback_dir/" "$PREFIX/"
+    log_event "install" "$name" "$version" "failed"
+    return 1
+  fi
+
+  # Manifest JSON
+  _generate_manifest "$staging" "$name" "$version"
 
   # Hooks post-install-system
   run_hook post-install-system "$port_dir"
@@ -78,7 +126,7 @@ install_port() {
   log_info "Registrando $name-$version"
   register_package "$name" "$version" "$staging"
 
-  # Ativar serviços (se definidos no port)
+  # Ativar serviços (systemd)
   if [ -d "$port_dir/service" ]; then
     log_info "Ativando serviços para $name"
     for svc in "$port_dir"/service/*; do
@@ -88,6 +136,7 @@ install_port() {
   fi
 
   log_info "Instalação de $name-$version concluída."
+  log_event "install" "$name" "$version" "success"
 }
 
 export -f install_port
