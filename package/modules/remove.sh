@@ -1,198 +1,167 @@
 #!/usr/bin/env bash
 # modules/remove.sh
-# Remoção de pacotes baseados em lista de arquivos gerada por install.sh
-# Usa register.sh para checar/atualizar registro, e hooks pre/post-remove.
-#
-# Exporta: cmd_remove <categoria/port> [--dry-run] [--skip-hooks]
-# Remove serviços systemd se SERVICE_ENABLE=yes e pacote definir SERVICE_UNIT (Makefile)
-# Respeita FILES_DIR e FILES_LIST_NAME via /etc/package.conf
+# Remove pacotes movendo arquivos para TRASH_DIR (recuperável) em vez de apagar imediatamente.
+# cmd_remove <categoria/port> [--dry-run] [--skip-hooks]
+# Lê /etc/package.conf para FILES_DIR, TRASH_DIR, FILES_LIST_NAME, SYSTEMD, etc.
 
 set -euo pipefail
-
 [ -f /etc/package.conf ] && source /etc/package.conf
 
 FILES_DIR=${FILES_DIR:-/var/lib/package/files}
 FILES_LIST_NAME=${FILES_LIST_NAME:-package.files}
 INSTALLED_DB_DIR=${INSTALLED_DB_DIR:-${INSTALLED_DB:-/var/lib/package/installed}}
+TRASH_DIR=${TRASH_DIR:-/var/lib/package/trash}
+TRASH_KEEP_DAYS=${TRASH_KEEP_DAYS:-30}   # opcional: limpeza automática antiga
 
-mkdir -p "$FILES_DIR" "$INSTALLED_DB_DIR"
+mkdir -p "$FILES_DIR" "$INSTALLED_DB_DIR" "$TRASH_DIR"
 
 # logging fallbacks
-: "${log_info:=:}"
-: "${log_warn:=:}"
-: "${log_error:=:}"
-: "${log_port:=:}"
+: "${log_info:=:}"; : "${log_warn:=:}"; : "${log_error:=:}"; : "${log_port:=:}"
 if ! declare -F log_info >/dev/null; then log_info(){ echo "[remove][INFO] $*"; }; fi
 if ! declare -F log_warn >/dev/null; then log_warn(){ echo "[remove][WARN] $*"; }; fi
 if ! declare -F log_error >/dev/null; then log_error(){ echo "[remove][ERROR] $*" >&2; }; fi
 if ! declare -F log_port >/dev/null; then log_port(){ echo "[$1] $2"; }; fi
 
-# external hooks/register functions expected (with fallbacks)
 : "${run_hook:=:}"
-if ! declare -F run_hook >/dev/null; then run_hook(){ log_warn "run_hook não implementado: $*"; return 0; }; fi
+if ! declare -F run_hook >/dev/null; then run_hook(){ log_warn "run_hook não disponível: $*"; return 0; }; fi
+: "${register_remove:=:}"
+if ! declare -F register_remove >/dev/null; then register_remove(){ log_warn "register_remove não implementado: $*"; return 0; }; fi
 : "${register_is_installed:=:}"
 if ! declare -F register_is_installed >/dev/null; then
   register_is_installed(){ local p="$1"; [ -f "${INSTALLED_DB_DIR}/$(echo "$p" | tr '/' '_').json" ]; }
 fi
-: "${register_remove:=:}"
-if ! declare -F register_remove >/dev/null; then
-  register_remove(){ log_warn "register_remove não implementado: $*"; return 0; }
-fi
 
-_run_as_root() {
-  if [ "$(id -u)" -eq 0 ]; then
-    "$@"
+_run_as_root(){
+  if [ "$(id -u)" -eq 0 ]; then "$@"; else
+    if command -v sudo >/dev/null 2>&1; then sudo "$@"; else log_error "Operação precisa de root: $*"; return 1; fi
+  fi
+}
+
+_files_list_path(){
+  local port="$1"
+  printf '%s/%s.list' "$FILES_DIR" "$(echo "$port" | tr '/' '_')"
+}
+
+# ensure destination in TRASH_DIR, preserve structure and timestamp
+_move_to_trash(){
+  local src="$1" port="$2"
+  [ -e "$src" ] || { log_warn "Arquivo não existe ao mover para lixeira: $src"; return 0; }
+  local rel
+  # build relative path (strip leading /)
+  rel="${src#/}"
+  # target path under TRASH_DIR/<port>/<rel>
+  local target_dir="${TRASH_DIR}/$(echo "$port" | tr '/' '_')/$(dirname "$rel")"
+  mkdir -p "$target_dir"
+  # move with sudo if needed
+  if mv "$src" "$target_dir/" 2>/dev/null; then
+    log_port "$port" "Movido para lixeira: $src -> $target_dir/"
   else
-    if command -v sudo >/dev/null 2>&1; then
-      sudo "$@"
+    if _run_as_root mv "$src" "$target_dir/"; then
+      log_port "$port" "Movido para lixeira (sudo): $src -> $target_dir/"
     else
-      log_error "Operação precisa de root (ou sudo): $*"
+      log_error "Falha ao mover $src para lixeira"
       return 1
+    fi
+  fi
+  return 0
+}
+
+# remove (move) files listed in listfile (dry-run supported)
+_remove_files_from_list(){
+  local listfile="$1" dry="$2" port="$3"
+  [ -f "$listfile" ] || { log_warn "Lista de arquivos não encontrada: $listfile"; return 0; }
+  local failcount=0
+  while IFS= read -r f || [ -n "$f" ]; do
+    [ -z "$f" ] && continue
+    # safety checks
+    if [ "$f" = "/" ] || [ -z "$f" ]; then log_warn "Ignorando caminho inseguro: $f"; continue; fi
+    if [ "$dry" -eq 1 ]; then
+      log_info "[dry-run] mover $f -> $TRASH_DIR/$(echo "$port" | tr '/' '_')/"
+      continue
+    fi
+    if ! _move_to_trash "$f" "$port"; then failcount=$((failcount+1)); fi
+  done < "$listfile"
+  return $failcount
+}
+
+# optionally cleanup old trash files older than TRASH_KEEP_DAYS
+_trash_maintenance(){
+  local days="${TRASH_KEEP_DAYS:-0}"
+  if [ -n "$days" ] && [ "$days" -gt 0 ]; then
+    if command -v find >/dev/null 2>&1; then
+      log_info "Limpando lixeira: removendo itens com mais de $days dias"
+      _run_as_root find "$TRASH_DIR" -mindepth 2 -mtime +"$days" -exec rm -rf {} + 2>/dev/null || true
     fi
   fi
 }
 
-_files_list_path() {
-  local port="$1"
-  local name=$(echo "$port" | tr '/' '_')
-  printf '%s/%s.list' "$FILES_DIR" "$name"
-}
-
-# stop systemd service if defined in Makefile (SERVICE_UNIT or name)
-_stop_service_if_defined() {
+_stop_service_if_defined(){
   local port="$1" mf="$PORTSDIR/$port/Makefile"
   [ -f "$mf" ] || return 0
   local unit
   unit=$(awk -F= '/^SERVICE_UNIT[[:space:]]*=/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$2); print $2; exit}' "$mf" | tr -d '"')
-  if [ -z "$unit" ]; then
-    # try default: service name = last component of port
-    unit=$(basename "$port")
-  fi
-  if [ "${SYSTEMD:-yes}" != "yes" ]; then
-    log_info "Systemd integration desabilitada; não paro serviços para $port"
-    return 0
-  fi
+  [ -z "$unit" ] && unit=$(basename "$port")
+  if [ "${SYSTEMD:-yes}" != "yes" ]; then log_info "Systemd integration desabilitada"; return 0; fi
   if command -v systemctl >/dev/null 2>&1; then
     log_info "Parando e desabilitando unit $unit (se existir)"
     _run_as_root systemctl stop "$unit" || true
     _run_as_root systemctl disable "$unit" || true
     _run_as_root systemctl daemon-reload || true
   fi
-  return 0
 }
 
-# remove files listed in listfile; supports dry-run
-_remove_files_from_list() {
-  local listfile="$1" dry="${2:-0}" port="$3"
-  [ -f "$listfile" ] || { log_warn "Lista de arquivos não encontrada: $listfile"; return 0; }
-
-  local failcount=0
-  while IFS= read -r f; do
-    [ -z "$f" ] && continue
-    # safety: avoid removing root or empty
-    if [ "$f" = "/" ] || [ -z "$f" ] || [[ "$f" =~ ^\.\.?$ ]]; then
-      log_warn "Ignorando caminho inseguro: $f"
-      continue
-    fi
-    if [ "$dry" -eq 1 ]; then
-      log_info "[dry-run] remover $f"
-    else
-      if [ -e "$f" ]; then
-        # try to remove file, fallback to sudo if necessary
-        if rm -f "$f" 2>/dev/null; then
-          log_port "$port" "Removido: $f"
-        else
-          log_warn "Falha ao remover $f sem sudo, tentando sudo"
-          if _run_as_root rm -f "$f"; then
-            log_port "$port" "Removido (sudo): $f"
-          else
-            log_error "Falha ao remover $f (necessita intervenção manual)"
-            failcount=$((failcount+1))
-          fi
-        fi
-      else
-        # maybe it's a directory
-        if [ -d "$f" ]; then
-          if rmdir "$f" 2>/dev/null; then
-            log_port "$port" "Diretório removido: $f"
-          else
-            # try recursive remove (careful)
-            log_warn "Tentando remoção recursiva de diretório: $f"
-            if rm -rf "$f" 2>/dev/null; then
-              log_port "$port" "Diretório removido recursivamente: $f"
-            else
-              if _run_as_root rm -rf "$f"; then
-                log_port "$port" "Diretório removido recursivamente (sudo): $f"
-              else
-                log_error "Falha ao remover diretório $f"
-                failcount=$((failcount+1))
-              fi
-            fi
-          fi
-        else
-          log_warn "Arquivo não existe: $f"
-        fi
-      fi
-    fi
-  done < "$listfile"
-
-  return $failcount
-}
-
-cmd_remove() {
+cmd_remove(){
   local port="$1"; shift || true
   local dry=0 skip_hooks=0
   while [ $# -gt 0 ]; do
-    case "$1" in
-      --dry-run) dry=1; shift ;;
-      --skip-hooks) skip_hooks=1; shift ;;
-      *) shift ;;
-    esac
+    case "$1" in --dry-run) dry=1; shift ;; --skip-hooks) skip_hooks=1; shift ;; *) shift ;; esac
   done
 
   [ -n "$port" ] || { log_error "Uso: package remove <categoria/port> [--dry-run]"; return 2; }
 
-  # sanity: check registration
   if ! register_is_installed "$port"; then
     log_warn "Pacote $port não registrado como instalado; ainda assim tentarei remover arquivos se lista existir"
   fi
 
-  # run pre-remove hooks
   if [ "$skip_hooks" -ne 1 ]; then
-    run_hook "$port" "pre-remove" || { log_warn "pre-remove hook retornou não-zero (continuando)"; }
+    run_hook "$port" "pre-remove" || log_warn "pre-remove hook falhou (continuando)"
   fi
 
-  # stop service if exists
   _stop_service_if_defined "$port"
 
-  # remove files
   local listfile; listfile=$(_files_list_path "$port")
   if [ -f "$listfile" ]; then
-    log_info "Removendo arquivos listados em $listfile"
+    log_info "Movendo arquivos listados em $listfile para lixeira"
     if ! _remove_files_from_list "$listfile" "$dry" "$port"; then
-      log_warn "Alguns arquivos falharam ao remover. Verifique logs."
+      log_warn "Alguns arquivos falharam ao mover para lixeira; verifique logs"
     fi
     if [ "$dry" -eq 0 ]; then
-      # remove the files list itself
-      rm -f "$listfile" || log_warn "Não foi possível remover lista $listfile"
+      # move listfile to trash as well (for audit) or remove depending on config
+      if [ "${REMOVE_FILES_LIST_ON_UNREGISTER:-no}" = "yes" ]; then
+        rm -f "$listfile" || log_warn "Não foi possível remover lista $listfile"
+      else
+        # move to trash folder for this port
+        _move_to_trash "$listfile" "$port" || true
+      fi
     fi
   else
-    log_warn "Lista de arquivos não encontrada ($listfile). Nada a remover a partir dela."
+    log_warn "Lista de arquivos não encontrada ($listfile)"
   fi
 
-  # run post-remove hooks
   if [ "$skip_hooks" -ne 1 ]; then
-    run_hook "$port" "post-remove" || { log_warn "post-remove hook retornou não-zero"; }
+    run_hook "$port" "post-remove" || log_warn "post-remove hook falhou"
   fi
 
-  # unregister package
   if [ "$dry" -eq 0 ]; then
     register_remove "$port"
   else
-    log_info "[dry-run] não removendo registro para $port"
+    log_info "[dry-run] registro não alterado para $port"
   fi
 
-  log_info "Remoção de $port concluída (dry=$dry)"
+  # background: maintain trash (cleanup old)
+  _trash_maintenance &
+
+  log_info "Remoção (move-to-trash) de $port concluída (dry=$dry)"
   return 0
 }
 
